@@ -1,0 +1,310 @@
+import os
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from data_provider.data_factory import data_provider
+from exp.exp_basic import Exp_Basic
+from models.token_llm_forecasting import TokenLLMForecasting
+from utils.metrics import metric
+from utils.tools import EarlyStopping, adjust_learning_rate, visual
+
+
+def build_setting(args):
+    return (
+        f"{args.model}_{args.data}_sl{args.seq_len}_pl{args.pred_len}_"
+        f"ps{args.patch_size}_st{args.stride}_dm{args.d_model}_v{args.vocab_size}"
+    )
+
+
+def get_target_index(args):
+    if isinstance(args.target_col, int):
+        return args.target_col
+
+    csv_path = os.path.join(args.root_path, args.data_path)
+    with open(csv_path, "r", encoding="utf-8") as file:
+        header = file.readline().strip().split(",")
+
+    columns = header[1:]
+    if args.target_col in columns:
+        return columns.index(args.target_col)
+    return 0
+
+
+def select_channel(x, target_idx):
+    if x.ndim == 2 and x.shape[-1] == 1:
+        return x[:, 0]
+    if x.ndim == 2:
+        return x
+    if target_idx is None:
+        return x[..., 0]
+    return x[..., target_idx]
+
+
+class TokenLLM_Main(Exp_Basic):
+    def __init__(self, args):
+        self._ensure_runtime_args(args)
+        super(TokenLLM_Main, self).__init__(args)
+        self.min_test_loss = np.inf
+        self.min_test_mae = np.inf
+        self.epoch_for_min_test_loss = 0
+
+    def _ensure_runtime_args(self, args):
+        if not hasattr(args, "use_gpu"):
+            args.use_gpu = False
+        if not hasattr(args, "use_multi_gpu"):
+            args.use_multi_gpu = False
+        if not hasattr(args, "gpu"):
+            args.gpu = 0
+        if not hasattr(args, "devices"):
+            args.devices = str(args.gpu)
+        if not hasattr(args, "device_ids"):
+            args.device_ids = [args.gpu]
+        if not hasattr(args, "use_amp"):
+            args.use_amp = False
+
+    def _build_model(self):
+        model = TokenLLMForecasting(self.args).float()
+
+        if self.args.use_multi_gpu and self.args.use_gpu:
+            model = nn.DataParallel(model, device_ids=self.args.device_ids)
+
+        return model
+
+    def _get_data(self, flag):
+        data_set, data_loader = data_provider(self.args, flag)
+        return data_set, data_loader
+
+    def _select_optimizer(self):
+        return torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+
+    def _select_criterion(self):
+        return torch.nn.MSELoss()
+
+    def _process_one_batch(self, batch_x, batch_y, teacher_forcing):
+        batch_x = batch_x.float().to(self.device)
+        batch_y = batch_y.float().to(self.device)
+
+        if self.args.use_amp:
+            with torch.amp.autocast(device_type="cuda"):
+                forecast, token_logits, pred_token_ids, recon, aux = self.model(
+                    batch_x, batch_y, teacher_forcing=teacher_forcing
+                )
+        else:
+            forecast, token_logits, pred_token_ids, recon, aux = self.model(
+                batch_x, batch_y, teacher_forcing=teacher_forcing
+            )
+
+        return forecast, batch_y, token_logits, pred_token_ids, recon, aux
+
+    def _compute_total_loss(self, criterion, forecast, token_logits, recon, aux, target):
+        forecast_loss = criterion(forecast, target)
+
+        recon_loss = torch.tensor(0.0, device=target.device)
+        if recon is not None:
+            recon_loss = criterion(recon, target)
+
+        token_ce = torch.tensor(0.0, device=target.device)
+        future_token_ids = aux.get("future_token_ids")
+        if future_token_ids is not None and token_logits is not None:
+            token_ce = F.cross_entropy(
+                token_logits.reshape(-1, token_logits.size(-1)),
+                future_token_ids.reshape(-1),
+            )
+
+        vq_loss = aux["vq_loss"]
+        total_loss = (
+            forecast_loss
+            + self.args.alpha * recon_loss
+            + self.args.beta * token_ce
+            + self.args.gamma * vq_loss
+        )
+        return total_loss
+
+    def _run_loader(self, data_loader, criterion, train_mode):
+        losses = []
+        preds, trues = [], []
+
+        self.model.train() if train_mode else self.model.eval()
+
+        with torch.set_grad_enabled(train_mode):
+            for batch_x, batch_y in data_loader:
+                forecast, target, token_logits, _, recon, aux = self._process_one_batch(
+                    batch_x, batch_y, teacher_forcing=train_mode
+                )
+                total_loss = self._compute_total_loss(
+                    criterion, forecast, token_logits, recon, aux, target
+                )
+
+                losses.append(total_loss.item())
+                preds.append(forecast.detach().cpu())
+                trues.append(target.detach().cpu())
+
+        preds = torch.cat(preds).numpy()
+        trues = torch.cat(trues).numpy()
+        mae, mse, rmse, mape, mspe = metric(preds, trues)
+        return float(np.mean(losses)), mae, mse, preds, trues, rmse, mape, mspe
+
+    def vali(self, vali_data, vali_loader, criterion):
+        del vali_data
+        loss, mae, mse, preds, trues, rmse, mape, mspe = self._run_loader(
+            vali_loader, criterion, train_mode=False
+        )
+        self.model.train()
+        return loss, mae, mse, preds, trues, rmse, mape, mspe
+
+    def train(self, setting, optunaTrialReport=None):
+        train_data, train_loader = self._get_data(flag="train")
+        vali_data, vali_loader = self._get_data(flag="val")
+        test_data, test_loader = self._get_data(flag="test")
+        del train_data, test_data
+
+        checkpoint_dir = os.path.join(self.args.checkpoints, setting)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        train_steps = len(train_loader)
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+        model_optim = self._select_optimizer()
+        criterion = self._select_criterion()
+        scaler = torch.amp.GradScaler(device="cuda", init_scale=1024) if self.args.use_amp else None
+
+        for epoch in range(self.args.train_epochs):
+            epoch_time = time.time()
+            train_losses = []
+            self.model.train()
+
+            for batch_x, batch_y in train_loader:
+                model_optim.zero_grad(set_to_none=True)
+                forecast, target, token_logits, _, recon, aux = self._process_one_batch(
+                    batch_x, batch_y, teacher_forcing=True
+                )
+                total_loss = self._compute_total_loss(
+                    criterion, forecast, token_logits, recon, aux, target
+                )
+
+                if self.args.use_amp:
+                    scaler.scale(total_loss).backward()
+                    scaler.step(model_optim)
+                    scaler.update()
+                else:
+                    total_loss.backward()
+                    model_optim.step()
+
+                train_losses.append(total_loss.item())
+
+            train_loss = float(np.mean(train_losses))
+            vali_loss, vali_mae, _, _, _, _, _, _ = self.vali(
+                vali_data, vali_loader, criterion
+            )
+            test_loss, test_mae, test_mse, _, _, _, _, _ = self.vali(
+                None, test_loader, criterion
+            )
+
+            if test_loss < self.min_test_loss:
+                self.min_test_loss = test_loss
+                self.min_test_mae = test_mae
+                self.epoch_for_min_test_loss = epoch
+
+            if optunaTrialReport is not None:
+                import optuna
+
+                optunaTrialReport.report(test_loss, epoch)
+                if optunaTrialReport.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+
+            print(
+                "Epoch {0}: Steps-{1} | Train Loss: {2:.5f} Vali.Loss: {3:.5f} "
+                "Vali.MAE: {4:.5f} Test.MSE: {5:.5f} Test.MAE: {6:.5f} | {7:.2f}s".format(
+                    epoch + 1,
+                    train_steps,
+                    train_loss,
+                    vali_loss,
+                    vali_mae,
+                    test_mse,
+                    test_mae,
+                    time.time() - epoch_time,
+                )
+            )
+
+            early_stopping(vali_loss, self.model, checkpoint_dir)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+            if np.isnan(train_loss):
+                print("Stopping: train loss is NaN")
+                break
+
+            adjust_learning_rate(model_optim, None, epoch + 1, self.args, printout=False)
+
+        best_model_path = os.path.join(self.args.checkpoints, setting, "checkpoint.pth")
+        self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
+        return self.model
+
+    def _save_visualization(self, results_dir, preds, trues):
+        target_idx = get_target_index(self.args) if self.args.use_multivariate else None
+        y_true = select_channel(trues[0], target_idx)
+        y_pred = select_channel(preds[0], target_idx)
+        visual(y_true, y_pred, name=os.path.join(results_dir, "forecast.png"))
+
+    def _save_tokens(self, test_loader, results_dir):
+        batch_x, batch_y = next(iter(test_loader))
+        batch_x = batch_x.float().to(self.device)
+        batch_y = batch_y.float().to(self.device)
+
+        self.model.eval()
+        with torch.no_grad():
+            _, _, pred_token_ids, _, aux = self.model(
+                batch_x, batch_y, teacher_forcing=False
+            )
+
+        np.save(
+            os.path.join(results_dir, "tokens_past.npy"),
+            aux["past_token_ids"].detach().cpu().numpy(),
+        )
+        np.save(
+            os.path.join(results_dir, "tokens_future_pred.npy"),
+            pred_token_ids.detach().cpu().numpy(),
+        )
+        if aux["future_token_ids"] is not None:
+            np.save(
+                os.path.join(results_dir, "tokens_future_true.npy"),
+                aux["future_token_ids"].detach().cpu().numpy(),
+            )
+
+    def test(self, setting=None, checkpoint_path=None, save_tokens=True, load_checkpoint=True):
+        if setting is None:
+            setting = build_setting(self.args)
+
+        if load_checkpoint:
+            checkpoint_path = checkpoint_path or os.path.join(
+                self.args.checkpoints, setting, "checkpoint.pth"
+            )
+            if not os.path.exists(checkpoint_path):
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+            self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+        else:
+            print("Skipping checkpoint load and evaluating current model weights.")
+
+        test_data, test_loader = self._get_data(flag="test")
+        criterion = self._select_criterion()
+        loss, mae, mse, preds, trues, rmse, mape, mspe = self.vali(
+            test_data, test_loader, criterion
+        )
+
+        print(f"Test Loss {loss:.5f} MSE {mse:.5f} MAE {mae:.5f}")
+
+        results_dir = os.path.join("results", setting)
+        os.makedirs(results_dir, exist_ok=True)
+        np.save(os.path.join(results_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
+        np.save(os.path.join(results_dir, "pred.npy"), preds)
+        np.save(os.path.join(results_dir, "true.npy"), trues)
+        self._save_visualization(results_dir, preds, trues)
+
+        if save_tokens:
+            self._save_tokens(test_loader, results_dir)
+
+        return mse, mae
