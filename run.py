@@ -31,8 +31,8 @@ def infer_num_channels(args):
 
 def build_setting(args):
     return (
-        f"{args.model}_{args.data}_sl{args.seq_len}_pl{args.pred_len}_"
-        f"ps{args.patch_size}_st{args.stride}_dm{args.d_model}_v{args.vocab_size}_"
+        f"{args.data}_sl{args.seq_len}_pl{args.pred_len}_"
+        f"ps{args.patch_size}_"
         f"predgpt2"
     )
 
