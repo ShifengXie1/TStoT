@@ -24,6 +24,7 @@ class TokenLLMForecasting(nn.Module):
 
         self.in_channels = configs.c_in
         self.out_channels = configs.c_out
+        self.max_token_len = self._num_patches(self.seq_len) + self._num_patches(self.pred_len)
 
         self.tokenizer = PatchTokenizer(
             patch_size=self.patch_size,
@@ -40,7 +41,12 @@ class TokenLLMForecasting(nn.Module):
             n_layers=self.n_layers,
             n_heads=self.n_heads,
             dropout=self.dropout,
-            max_len=4096,
+            max_len=max(2, self.max_token_len),
+            model_name=getattr(configs, "gpt_model_name", "openai-community/gpt2"),
+            local_model_path=getattr(configs, "gpt_local_path", "./gpt"),
+            use_pretrained=getattr(configs, "use_pretrained_gpt2", True),
+            prefer_local=getattr(configs, "prefer_local_gpt2", True),
+            local_files_only=getattr(configs, "gpt_local_files_only", True),
         )
 
         self.detokenizer = Detokenizer(
@@ -76,7 +82,7 @@ class TokenLLMForecasting(nn.Module):
             future_token_ids, _, _, vq_loss_future = self.tokenizer(y)
 
         pred_steps = self._num_patches(self.pred_len)
-        token_logits, pred_token_ids = self.token_forecaster(
+        token_logits, pred_token_ids, token_loss = self.token_forecaster(
             past_token_ids,
             future_tokens=future_token_ids,
             pred_steps=pred_steps,
@@ -97,6 +103,7 @@ class TokenLLMForecasting(nn.Module):
             "recon_past": recon_past,
             "recon_future": recon_future,
             "vq_loss": vq_loss_past + vq_loss_future,
+            "token_loss": token_loss,
             "past_patch_emb": past_patch_emb,
             "past_codebook_emb": past_codebook_emb,
         }

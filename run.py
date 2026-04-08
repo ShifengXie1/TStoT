@@ -32,8 +32,15 @@ def infer_num_channels(args):
 def build_setting(args):
     return (
         f"{args.model}_{args.data}_sl{args.seq_len}_pl{args.pred_len}_"
-        f"ps{args.patch_size}_st{args.stride}_dm{args.d_model}_v{args.vocab_size}"
+        f"ps{args.patch_size}_st{args.stride}_dm{args.d_model}_v{args.vocab_size}_"
+        f"predgpt2"
     )
+
+
+def resolve_gpt_local_path(path):
+    if path is None:
+        return None
+    return os.path.abspath(path)
 
 
 def build_args():
@@ -55,6 +62,11 @@ def build_args():
     parser.add_argument("--n_layers", type=int, default=4)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--gpt_model_name", type=str, default="openai-community/gpt2")
+    parser.add_argument("--gpt_local_path", type=str, default="./gpt")
+    parser.add_argument("--use_pretrained_gpt2", type=str2bool, default=True)
+    parser.add_argument("--prefer_local_gpt2", type=str2bool, default=True)
+    parser.add_argument("--gpt_local_files_only", type=str2bool, default=True)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=0.001)
     parser.add_argument("--train_epochs", type=int, default=10)
@@ -80,6 +92,7 @@ def build_args():
     args.use_gpu = bool(args.use_gpu) and torch.cuda.is_available()
     args.use_multi_gpu = bool(args.use_multi_gpu)
     args.use_amp = bool(args.use_amp) and args.use_gpu
+    args.gpt_local_path = resolve_gpt_local_path(args.gpt_local_path)
     args.devices = str(args.devices if args.devices is not None else args.gpu)
     args.device_ids = [
         int(device)

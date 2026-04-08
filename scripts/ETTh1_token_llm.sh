@@ -12,6 +12,11 @@ export D_MODEL=128
 export N_LAYERS=4
 export N_HEADS=4
 export DROPOUT=0.1
+export GPT_MODEL_NAME="openai-community/gpt2"
+export GPT_LOCAL_PATH="./gpt"
+export USE_PRETRAINED_GPT2=true
+export PREFER_LOCAL_GPT2=true
+export GPT_LOCAL_FILES_ONLY=true
 
 export BATCH_SIZE=32
 export LEARNING_RATE=0.001
@@ -46,6 +51,11 @@ for PRED_LEN in 96 192 336 720; do
     --n_layers $N_LAYERS \
     --n_heads $N_HEADS \
     --dropout $DROPOUT \
+    --gpt_model_name $GPT_MODEL_NAME \
+    --gpt_local_path $GPT_LOCAL_PATH \
+    --use_pretrained_gpt2 $USE_PRETRAINED_GPT2 \
+    --prefer_local_gpt2 $PREFER_LOCAL_GPT2 \
+    --gpt_local_files_only $GPT_LOCAL_FILES_ONLY \
     --batch_size $BATCH_SIZE \
     --learning_rate $LEARNING_RATE \
     --train_epochs $TRAIN_EPOCHS \

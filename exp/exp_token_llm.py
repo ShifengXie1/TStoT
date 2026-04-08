@@ -16,7 +16,8 @@ from utils.tools import EarlyStopping, adjust_learning_rate, visual
 def build_setting(args):
     return (
         f"{args.model}_{args.data}_sl{args.seq_len}_pl{args.pred_len}_"
-        f"ps{args.patch_size}_st{args.stride}_dm{args.d_model}_v{args.vocab_size}"
+        f"ps{args.patch_size}_st{args.stride}_dm{args.d_model}_v{args.vocab_size}_"
+        f"predgpt2"
     )
 
 
@@ -107,9 +108,12 @@ class TokenLLM_Main(Exp_Basic):
         if recon is not None:
             recon_loss = criterion(recon, target)
 
-        token_ce = torch.tensor(0.0, device=target.device)
+        token_ce = aux.get("token_loss")
         future_token_ids = aux.get("future_token_ids")
-        if future_token_ids is not None and token_logits is not None:
+        if token_ce is None:
+            token_ce = torch.tensor(0.0, device=target.device)
+
+        if future_token_ids is not None and token_logits is not None and aux.get("token_loss") is None:
             token_ce = F.cross_entropy(
                 token_logits.reshape(-1, token_logits.size(-1)),
                 future_token_ids.reshape(-1),
