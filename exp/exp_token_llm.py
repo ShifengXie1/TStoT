@@ -92,11 +92,11 @@ class TokenLLM_Main(Exp_Basic):
     def _build_results_dir(self, setting):
         run_dt = datetime.now()
         date_str = run_dt.strftime("%Y-%m-%d")
-        base_dir = os.path.join("results", date_str)
-        results_dir = os.path.join(base_dir, setting)
+        base_dir = "results"
+        results_dir = os.path.join(base_dir, f"{date_str}_{setting}")
         run_index = 2
         while os.path.exists(results_dir):
-            results_dir = os.path.join(base_dir, f"{setting}_run{run_index}")
+            results_dir = os.path.join(base_dir, f"{date_str}_{setting}_run{run_index}")
             run_index += 1
         os.makedirs(results_dir, exist_ok=True)
         return results_dir, run_dt
@@ -111,6 +111,7 @@ class TokenLLM_Main(Exp_Basic):
             f"predictor={self._get_predictor_name()} "
             f"setting={setting} "
             f"data={self.args.data} "
+            f"\n"
             f"mse={metrics_dict['mse']:.5f} "
             f"mae={metrics_dict['mae']:.5f} "
             f"rmse={metrics_dict['rmse']:.5f} "
