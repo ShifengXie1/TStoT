@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -78,6 +79,48 @@ class TokenLLM_Main(Exp_Basic):
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
+
+    def _get_base_model(self):
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+    def _get_predictor_name(self):
+        token_forecaster = self._get_base_model().token_forecaster
+        if getattr(token_forecaster, "use_pretrained", False):
+            return getattr(token_forecaster, "load_source", self.args.gpt_model_name)
+        return "gpt2-scratch"
+
+    def _build_results_dir(self, setting):
+        run_dt = datetime.now()
+        date_str = run_dt.strftime("%Y-%m-%d")
+        base_dir = os.path.join("results", date_str)
+        results_dir = os.path.join(base_dir, setting)
+        run_index = 2
+        while os.path.exists(results_dir):
+            results_dir = os.path.join(base_dir, f"{setting}_run{run_index}")
+            run_index += 1
+        os.makedirs(results_dir, exist_ok=True)
+        return results_dir, run_dt
+
+    def _append_results_summary(self, run_dt, setting, results_dir, metrics_dict):
+        summary_path = os.path.join("results", "results.txt")
+        os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+
+        summary_line = (
+            f"[{run_dt.strftime('%Y-%m-%d')}] "
+            f"model={self.args.model} "
+            f"predictor={self._get_predictor_name()} "
+            f"setting={setting} "
+            f"data={self.args.data} "
+            f"mse={metrics_dict['mse']:.5f} "
+            f"mae={metrics_dict['mae']:.5f} "
+            f"rmse={metrics_dict['rmse']:.5f} "
+            f"mape={metrics_dict['mape']:.5f} "
+            f"mspe={metrics_dict['mspe']:.5f} "
+            f"loss={metrics_dict['loss']:.5f} "
+            f"dir={results_dir}"
+        )
+        with open(summary_path, "a", encoding="utf-8") as file:
+            file.write(summary_line + "\n")
 
     def _select_optimizer(self):
         return torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
@@ -301,8 +344,7 @@ class TokenLLM_Main(Exp_Basic):
 
         print(f"Test Loss {loss:.5f} MSE {mse:.5f} MAE {mae:.5f}")
 
-        results_dir = os.path.join("results", setting)
-        os.makedirs(results_dir, exist_ok=True)
+        results_dir, run_dt = self._build_results_dir(setting)
         np.save(os.path.join(results_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(results_dir, "pred.npy"), preds)
         np.save(os.path.join(results_dir, "true.npy"), trues)
@@ -310,5 +352,20 @@ class TokenLLM_Main(Exp_Basic):
 
         if save_tokens:
             self._save_tokens(test_loader, results_dir)
+
+        self._append_results_summary(
+            run_dt,
+            setting,
+            results_dir,
+            {
+                "loss": loss,
+                "mae": mae,
+                "mse": mse,
+                "rmse": rmse,
+                "mape": mape,
+                "mspe": mspe,
+            },
+        )
+        print(f"Results saved to {results_dir}")
 
         return mse, mae
