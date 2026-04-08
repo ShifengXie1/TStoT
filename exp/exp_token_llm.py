@@ -141,19 +141,30 @@ class TokenLLM_Main(Exp_Basic):
         os.makedirs(os.path.dirname(summary_path), exist_ok=True)
 
         summary_line = (
-            f"[{run_dt.strftime('%Y-%m-%d')}] "
+            f"[{run_dt.strftime('%Y-%m-%d-%H%M%S')}] "
             f"model={self.args.model} "
-            f"predictor={self._get_predictor_name()} "
-            f"setting={setting} "
+            f"\n"
             f"data={self.args.data} "
+            f"\n"
+            f"seq_len={self.args.seq_len} "
+            f"pred_len={self.args.pred_len}"
+            f"\n"
+            f"patch_size={self.args.patch_size} "
+            f"\n"
+            f"stride={self.args.stride} "
+            f"\n"
+            f"d_model={self.args.d_model} "
+            f"\n"
+            f"vocab_size={self.args.vocab_size} "
             f"\n"
             f"mse={metrics_dict['mse']:.5f} "
             f"mae={metrics_dict['mae']:.5f} "
+            f"\n"
             f"rmse={metrics_dict['rmse']:.5f} "
             f"mape={metrics_dict['mape']:.5f} "
             f"mspe={metrics_dict['mspe']:.5f} "
+            f"\n"
             f"loss={metrics_dict['loss']:.5f} "
-            f"dir={results_dir}"
         )
         with open(summary_path, "a", encoding="utf-8") as file:
             file.write(summary_line + "\n")
