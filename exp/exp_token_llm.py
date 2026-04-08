@@ -155,6 +155,7 @@ class TokenLLM_Main(Exp_Basic):
             f"mspe={metrics_dict['mspe']:.5f} "
             f"\n"
             f"loss={metrics_dict['loss']:.5f} "
+            f"\n"
         )
         with open(summary_path, "a", encoding="utf-8") as file:
             file.write(summary_line + "\n")
