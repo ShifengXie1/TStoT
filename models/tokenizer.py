@@ -31,10 +31,16 @@ class PatchTokenizer(nn.Module):
         b, l, c = x.shape
         if l < self.patch_size:
             raise ValueError(f"seq_len {l} < patch_size {self.patch_size}")
-        num_patches = 1 + (l - self.patch_size) // self.stride
-        end = (num_patches - 1) * self.stride + self.patch_size
-        x = x[:, :end, :]
-        # TODO: consider padding to cover the tail when length is not aligned with stride.
+
+        remaining = max(0, l - self.patch_size)
+        num_patches = 1 + (remaining + self.stride - 1) // self.stride
+        total_len = self.patch_size + (num_patches - 1) * self.stride
+        pad_len = total_len - l
+        if pad_len > 0:
+            # Replicate the tail so the last patch can still cover the sequence end.
+            x = x.transpose(1, 2)
+            x = F.pad(x, (0, pad_len), mode="replicate")
+            x = x.transpose(1, 2).contiguous()
 
         patches = x.unfold(dimension=1, size=self.patch_size, step=self.stride)
         # unfold returns [B, N, C, patch_size]; move to [B, N, patch_size, C]

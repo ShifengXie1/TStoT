@@ -60,8 +60,8 @@ class TokenLLMForecasting(nn.Module):
     def _num_patches(self, length):
         if length < self.patch_size:
             return 0
-        # TODO: consider padding to cover the tail when length is not aligned with stride.
-        return 1 + (length - self.patch_size) // self.stride
+        remaining = max(0, length - self.patch_size)
+        return 1 + (remaining + self.stride - 1) // self.stride
 
     def forward(self, x, y=None, teacher_forcing=True):
         """
@@ -74,12 +74,13 @@ class TokenLLMForecasting(nn.Module):
           recon: [B, L_recon, C]
           aux: dict
         """
-        past_token_ids, _, _, vq_loss_past = self.tokenizer(x)
+        past_token_ids, _, past_quantized_emb, vq_loss_past = self.tokenizer(x)
 
         future_token_ids = None
+        future_quantized_emb = None
         vq_loss_future = torch.tensor(0.0, device=x.device)
         if y is not None:
-            future_token_ids, _, _, vq_loss_future = self.tokenizer(y)
+            future_token_ids, _, future_quantized_emb, vq_loss_future = self.tokenizer(y)
 
         pred_steps = self._num_patches(self.pred_len)
         token_logits, pred_token_ids, token_loss = self.token_forecaster(
@@ -89,15 +90,29 @@ class TokenLLMForecasting(nn.Module):
             teacher_forcing=teacher_forcing,
         )
 
-        forecast, _ = self.detokenizer(pred_token_ids, target_len=self.pred_len)
+        if teacher_forcing and token_logits is not None and future_token_ids is not None:
+            forecast, _ = self.detokenizer.logits_to_sequence(
+                token_logits,
+                target_len=self.pred_len,
+            )
+        else:
+            forecast, _ = self.detokenizer(pred_token_ids, target_len=self.pred_len)
 
+        recon_past, _ = self.detokenizer.embeddings_to_sequence(
+            past_quantized_emb,
+            target_len=self.seq_len,
+        )
         recon_future = None
-        if future_token_ids is not None:
-            recon_future, _ = self.detokenizer(future_token_ids, target_len=self.pred_len)
+        if future_quantized_emb is not None:
+            recon_future, _ = self.detokenizer.embeddings_to_sequence(
+                future_quantized_emb,
+                target_len=self.pred_len,
+            )
 
         aux = {
             "past_token_ids": past_token_ids,
             "future_token_ids": future_token_ids,
+            "recon_past": recon_past,
             "vq_loss": vq_loss_past + vq_loss_future,
             "token_loss": token_loss,
         }

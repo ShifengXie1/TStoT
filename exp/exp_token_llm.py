@@ -160,7 +160,11 @@ class TokenLLM_Main(Exp_Basic):
             file.write(summary_line + "\n")
 
     def _select_optimizer(self):
-        return torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        return torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.args.learning_rate,
+            weight_decay=self.args.weight_decay,
+        )
 
     def _select_criterion(self):
         return torch.nn.MSELoss()
@@ -179,14 +183,20 @@ class TokenLLM_Main(Exp_Basic):
                 batch_x, batch_y, teacher_forcing=teacher_forcing
             )
 
-        return forecast, batch_y, token_logits, recon, aux
+        return batch_x, forecast, batch_y, token_logits, recon, aux
 
-    def _compute_total_loss(self, criterion, forecast, token_logits, recon, aux, target):
+    def _compute_total_loss(self, criterion, history, forecast, token_logits, recon, aux, target):
         forecast_loss = criterion(forecast, target)
 
-        recon_loss = torch.tensor(0.0, device=target.device)
+        recon_terms = []
+        recon_past = aux.get("recon_past")
+        if recon_past is not None:
+            recon_terms.append(criterion(recon_past, history))
         if recon is not None:
-            recon_loss = criterion(recon, target)
+            recon_terms.append(criterion(recon, target))
+        recon_loss = torch.stack(recon_terms).mean() if recon_terms else torch.tensor(
+            0.0, device=target.device
+        )
 
         token_ce = aux.get("token_loss")
         future_token_ids = aux.get("future_token_ids")
@@ -216,11 +226,11 @@ class TokenLLM_Main(Exp_Basic):
 
         with torch.set_grad_enabled(train_mode):
             for batch_x, batch_y in data_loader:
-                forecast, target, token_logits, recon, aux = self._process_one_batch(
+                history, forecast, target, token_logits, recon, aux = self._process_one_batch(
                     batch_x, batch_y, teacher_forcing=train_mode
                 )
                 total_loss = self._compute_total_loss(
-                    criterion, forecast, token_logits, recon, aux, target
+                    criterion, history, forecast, token_logits, recon, aux, target
                 )
 
                 losses.append(total_loss.item())
@@ -262,19 +272,24 @@ class TokenLLM_Main(Exp_Basic):
 
             for batch_x, batch_y in train_loader:
                 model_optim.zero_grad(set_to_none=True)
-                forecast, target, token_logits, recon, aux = self._process_one_batch(
+                history, forecast, target, token_logits, recon, aux = self._process_one_batch(
                     batch_x, batch_y, teacher_forcing=True
                 )
                 total_loss = self._compute_total_loss(
-                    criterion, forecast, token_logits, recon, aux, target
+                    criterion, history, forecast, token_logits, recon, aux, target
                 )
 
                 if self.args.use_amp:
                     scaler.scale(total_loss).backward()
+                    if self.args.max_grad_norm > 0:
+                        scaler.unscale_(model_optim)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                     scaler.step(model_optim)
                     scaler.update()
                 else:
                     total_loss.backward()
+                    if self.args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                     model_optim.step()
 
                 train_losses.append(total_loss.item())

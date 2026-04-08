@@ -5,28 +5,30 @@ export ROOT_PATH="./data/ETT"
 export DATA_PATH="ETTh1.csv"
 
 export SEQ_LEN=96
-export PATCH_SIZE=16
-export STRIDE=16
-export VOCAB_SIZE=512
+export PATCH_SIZE=8
+export STRIDE=8
+export VOCAB_SIZE=128
 export D_MODEL=128
 export N_LAYERS=4
 export N_HEADS=4
 export DROPOUT=0.1
 export GPT_MODEL_NAME="openai-community/gpt2"
 export GPT_LOCAL_PATH="./gpt"
-export USE_PRETRAINED_GPT2=true
+export USE_PRETRAINED_GPT2=false
 export PREFER_LOCAL_GPT2=true
 export GPT_LOCAL_FILES_ONLY=true
 
 export BATCH_SIZE=32
-export LEARNING_RATE=0.001
-export TRAIN_EPOCHS=10
-export PATIENCE=3
+export LEARNING_RATE=0.0001
+export WEIGHT_DECAY=0.0001
+export TRAIN_EPOCHS=30
+export PATIENCE=6
 export LRADJ="type3"
 
-export ALPHA=0.5
-export BETA=0.5
-export GAMMA=0.1
+export ALPHA=0.3
+export BETA=1.0
+export GAMMA=0.05
+export MAX_GRAD_NORM=1.0
 
 export USE_MULTIVARIATE=false
 export TARGET_COL="OT"
@@ -58,12 +60,14 @@ for PRED_LEN in 96 192 336 720; do
     --gpt_local_files_only $GPT_LOCAL_FILES_ONLY \
     --batch_size $BATCH_SIZE \
     --learning_rate $LEARNING_RATE \
+    --weight_decay $WEIGHT_DECAY \
     --train_epochs $TRAIN_EPOCHS \
     --patience $PATIENCE \
     --lradj $LRADJ \
     --alpha $ALPHA \
     --beta $BETA \
     --gamma $GAMMA \
+    --max_grad_norm $MAX_GRAD_NORM \
     --use_multivariate $USE_MULTIVARIATE \
     --target_col $TARGET_COL \
     --use_gpu $USE_GPU \
