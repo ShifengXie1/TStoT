@@ -20,7 +20,7 @@ class Detokenizer(nn.Module):
             emb = self.codebook(token_ids)
         else:
             emb = self.codebook[token_ids]
-        b, n, d = emb.shape
+        b, n, _ = emb.shape
         patch_flat = self.patch_recon(emb)
         patches = patch_flat.view(b, n, self.patch_size, self.out_channels)
         return patches

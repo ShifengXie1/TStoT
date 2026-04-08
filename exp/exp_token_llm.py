@@ -83,30 +83,20 @@ class TokenLLM_Main(Exp_Basic):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
 
-    def _get_base_model(self):
-        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-
-    def _get_predictor_name(self):
-        token_forecaster = self._get_base_model().token_forecaster
-        if getattr(token_forecaster, "use_pretrained", False):
-            return getattr(token_forecaster, "load_source", self.args.gpt_model_name)
-        return "gpt2-scratch"
-
     def _build_results_dir(self, setting):
-        run_dt = datetime.now()
-        date_str = run_dt.strftime("%Y-%m-%d-%H%M%S")
-        base_dir = "results"
-        results_dir = os.path.join(base_dir, f"{date_str}_{setting}")
-        run_index = 2
-        while os.path.exists(results_dir):
-            results_dir = os.path.join(base_dir, f"{date_str}_{setting}_run{run_index}")
-            run_index += 1
-        os.makedirs(results_dir, exist_ok=True)
-        return results_dir, run_dt
-
-    def _ensure_run_dir(self, setting):
         if self.run_dir is None:
-            self.run_dir, self.run_dt = self._build_results_dir(setting)
+            run_dt = datetime.now()
+            date_str = run_dt.strftime("%Y-%m-%d-%H%M%S")
+            base_dir = "results"
+            results_dir = os.path.join(base_dir, f"{date_str}_{setting}")
+            run_index = 2
+            while os.path.exists(results_dir):
+                results_dir = os.path.join(base_dir, f"{date_str}_{setting}_run{run_index}")
+                run_index += 1
+            self.run_dir = results_dir
+            self.run_dt = run_dt
+
+        os.makedirs(self.run_dir, exist_ok=True)
         return self.run_dir
 
     def _resolve_checkpoint_path(self, setting, checkpoint_path=None):
@@ -136,7 +126,7 @@ class TokenLLM_Main(Exp_Basic):
 
         return None
 
-    def _append_results_summary(self, run_dt, setting, results_dir, metrics_dict):
+    def _append_results_summary(self, run_dt, metrics_dict):
         summary_path = os.path.join("results", "results.txt")
         os.makedirs(os.path.dirname(summary_path), exist_ok=True)
 
@@ -181,15 +171,15 @@ class TokenLLM_Main(Exp_Basic):
 
         if self.args.use_amp:
             with torch.amp.autocast(device_type="cuda"):
-                forecast, token_logits, pred_token_ids, recon, aux = self.model(
+                forecast, token_logits, _, recon, aux = self.model(
                     batch_x, batch_y, teacher_forcing=teacher_forcing
                 )
         else:
-            forecast, token_logits, pred_token_ids, recon, aux = self.model(
+            forecast, token_logits, _, recon, aux = self.model(
                 batch_x, batch_y, teacher_forcing=teacher_forcing
             )
 
-        return forecast, batch_y, token_logits, pred_token_ids, recon, aux
+        return forecast, batch_y, token_logits, recon, aux
 
     def _compute_total_loss(self, criterion, forecast, token_logits, recon, aux, target):
         forecast_loss = criterion(forecast, target)
@@ -226,7 +216,7 @@ class TokenLLM_Main(Exp_Basic):
 
         with torch.set_grad_enabled(train_mode):
             for batch_x, batch_y in data_loader:
-                forecast, target, token_logits, _, recon, aux = self._process_one_batch(
+                forecast, target, token_logits, recon, aux = self._process_one_batch(
                     batch_x, batch_y, teacher_forcing=train_mode
                 )
                 total_loss = self._compute_total_loss(
@@ -256,7 +246,7 @@ class TokenLLM_Main(Exp_Basic):
         test_data, test_loader = self._get_data(flag="test")
         del train_data, test_data
 
-        checkpoint_dir = self._ensure_run_dir(setting)
+        checkpoint_dir = self._build_results_dir(setting)
         print(f"Checkpoint directory: {checkpoint_dir}")
 
         train_steps = len(train_loader)
@@ -272,7 +262,7 @@ class TokenLLM_Main(Exp_Basic):
 
             for batch_x, batch_y in train_loader:
                 model_optim.zero_grad(set_to_none=True)
-                forecast, target, token_logits, _, recon, aux = self._process_one_batch(
+                forecast, target, token_logits, recon, aux = self._process_one_batch(
                     batch_x, batch_y, teacher_forcing=True
                 )
                 total_loss = self._compute_total_loss(
@@ -374,7 +364,7 @@ class TokenLLM_Main(Exp_Basic):
 
         if load_checkpoint:
             checkpoint_path = self._resolve_checkpoint_path(setting, checkpoint_path=checkpoint_path)
-            if not os.path.exists(checkpoint_path):
+            if checkpoint_path is None or not os.path.exists(checkpoint_path):
                 raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
             self.run_dir = os.path.dirname(checkpoint_path)
@@ -383,7 +373,7 @@ class TokenLLM_Main(Exp_Basic):
             self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
         else:
             print("Skipping checkpoint load and evaluating current model weights.")
-            self._ensure_run_dir(setting)
+            self._build_results_dir(setting)
 
         test_data, test_loader = self._get_data(flag="test")
         criterion = self._select_criterion()
@@ -393,7 +383,7 @@ class TokenLLM_Main(Exp_Basic):
 
         print(f"Test Loss {loss:.5f} MSE {mse:.5f} MAE {mae:.5f}")
 
-        results_dir = self._ensure_run_dir(setting)
+        results_dir = self._build_results_dir(setting)
         run_dt = self.run_dt or datetime.now()
         np.save(os.path.join(results_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(results_dir, "pred.npy"), preds)
@@ -405,8 +395,6 @@ class TokenLLM_Main(Exp_Basic):
 
         self._append_results_summary(
             run_dt,
-            setting,
-            results_dir,
             {
                 "loss": loss,
                 "mae": mae,

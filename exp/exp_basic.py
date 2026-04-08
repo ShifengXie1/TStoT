@@ -1,36 +1,37 @@
 import os
-import torch
-import numpy as np
 
-class Exp_Basic(object): # 选设备
+import torch
+
+
+class Exp_Basic:
     def __init__(self, args):
         self.args = args
         self.device = self._acquire_device()
         self.model = self._build_model().to(self.device)
 
-    def _build_model(self): # 必须由子类重写
+    def _build_model(self):
         raise NotImplementedError
-        return None
-    
+
     def _acquire_device(self):
         if self.args.use_gpu:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.args.gpu) if not self.args.use_multi_gpu else self.args.devices
-            device = torch.device('cuda:{}'.format(self.args.gpu))
-            print('Use GPU: cuda:{}'.format(self.args.gpu))
+            os.environ["CUDA_VISIBLE_DEVICES"] = (
+                str(self.args.gpu) if not self.args.use_multi_gpu else self.args.devices
+            )
+            device = torch.device(f"cuda:{self.args.gpu}")
+            print(f"Use GPU: cuda:{self.args.gpu}")
         else:
-            device = torch.device('cpu')
-            print('Use CPU')
+            device = torch.device("cpu")
+            print("Use CPU")
         return device
 
-    def _get_data(self):
-        pass
+    def _get_data(self, flag):
+        raise NotImplementedError
 
-    def vali(self):
-        pass
+    def vali(self, *args, **kwargs):
+        raise NotImplementedError
 
-    def train(self):
-        pass
+    def train(self, *args, **kwargs):
+        raise NotImplementedError
 
-    def test(self):
-        pass
-    
+    def test(self, *args, **kwargs):
+        raise NotImplementedError

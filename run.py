@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from exp.exp_token_llm import TokenLLM_Main
+from exp.exp_token_llm import TokenLLM_Main, build_setting
 from utils.tools import set_random_seed
 
 
@@ -27,14 +27,6 @@ def infer_num_channels(args):
     with open(csv_path, "r", encoding="utf-8") as file:
         header = file.readline().strip().split(",")
     return max(1, len(header) - 1)
-
-
-def build_setting(args):
-    return (
-        f"{args.data}_sl{args.seq_len}_pl{args.pred_len}_"
-        f"ps{args.patch_size}_"
-        f"predgpt2"
-    )
 
 
 def resolve_gpt_local_path(path):

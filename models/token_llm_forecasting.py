@@ -74,7 +74,7 @@ class TokenLLMForecasting(nn.Module):
           recon: [B, L_recon, C]
           aux: dict
         """
-        past_token_ids, past_patch_emb, past_codebook_emb, vq_loss_past = self.tokenizer(x)
+        past_token_ids, _, _, vq_loss_past = self.tokenizer(x)
 
         future_token_ids = None
         vq_loss_future = torch.tensor(0.0, device=x.device)
@@ -91,8 +91,6 @@ class TokenLLMForecasting(nn.Module):
 
         forecast, _ = self.detokenizer(pred_token_ids, target_len=self.pred_len)
 
-        # Reconstruction for token reconstruction loss
-        recon_past, _ = self.detokenizer(past_token_ids, target_len=self.seq_len)
         recon_future = None
         if future_token_ids is not None:
             recon_future, _ = self.detokenizer(future_token_ids, target_len=self.pred_len)
@@ -100,11 +98,7 @@ class TokenLLMForecasting(nn.Module):
         aux = {
             "past_token_ids": past_token_ids,
             "future_token_ids": future_token_ids,
-            "recon_past": recon_past,
-            "recon_future": recon_future,
             "vq_loss": vq_loss_past + vq_loss_future,
             "token_loss": token_loss,
-            "past_patch_emb": past_patch_emb,
-            "past_codebook_emb": past_codebook_emb,
         }
         return forecast, token_logits, pred_token_ids, recon_future, aux
