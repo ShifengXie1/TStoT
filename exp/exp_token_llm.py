@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime
+from glob import glob
 
 import numpy as np
 import torch
@@ -53,6 +54,8 @@ class TokenLLM_Main(Exp_Basic):
         self.min_test_loss = np.inf
         self.min_test_mae = np.inf
         self.epoch_for_min_test_loss = 0
+        self.run_dt = None
+        self.run_dir = None
 
     def _ensure_runtime_args(self, args):
         if not hasattr(args, "use_gpu"):
@@ -91,7 +94,7 @@ class TokenLLM_Main(Exp_Basic):
 
     def _build_results_dir(self, setting):
         run_dt = datetime.now()
-        date_str = run_dt.strftime("%Y-%m-%d")
+        date_str = run_dt.strftime("%Y-%m-%d-%H%M%S")
         base_dir = "results"
         results_dir = os.path.join(base_dir, f"{date_str}_{setting}")
         run_index = 2
@@ -100,6 +103,38 @@ class TokenLLM_Main(Exp_Basic):
             run_index += 1
         os.makedirs(results_dir, exist_ok=True)
         return results_dir, run_dt
+
+    def _ensure_run_dir(self, setting):
+        if self.run_dir is None:
+            self.run_dir, self.run_dt = self._build_results_dir(setting)
+        return self.run_dir
+
+    def _resolve_checkpoint_path(self, setting, checkpoint_path=None):
+        if checkpoint_path:
+            return checkpoint_path
+
+        if self.run_dir is not None:
+            run_checkpoint = os.path.join(self.run_dir, "checkpoint.pth")
+            if os.path.exists(run_checkpoint):
+                return run_checkpoint
+
+        result_patterns = [
+            os.path.join("results", f"*_{setting}", "checkpoint.pth"),
+            os.path.join("results", f"*_{setting}_run*", "checkpoint.pth"),
+        ]
+        candidate_paths = []
+        for pattern in result_patterns:
+            candidate_paths.extend(glob(pattern))
+
+        if candidate_paths:
+            candidate_paths = sorted(candidate_paths, key=os.path.getmtime, reverse=True)
+            return candidate_paths[0]
+
+        legacy_checkpoint = os.path.join(self.args.checkpoints, setting, "checkpoint.pth")
+        if os.path.exists(legacy_checkpoint):
+            return legacy_checkpoint
+
+        return None
 
     def _append_results_summary(self, run_dt, setting, results_dir, metrics_dict):
         summary_path = os.path.join("results", "results.txt")
@@ -210,8 +245,8 @@ class TokenLLM_Main(Exp_Basic):
         test_data, test_loader = self._get_data(flag="test")
         del train_data, test_data
 
-        checkpoint_dir = os.path.join(self.args.checkpoints, setting)
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_dir = self._ensure_run_dir(setting)
+        print(f"Checkpoint directory: {checkpoint_dir}")
 
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
@@ -287,7 +322,7 @@ class TokenLLM_Main(Exp_Basic):
 
             adjust_learning_rate(model_optim, None, epoch + 1, self.args, printout=False)
 
-        best_model_path = os.path.join(self.args.checkpoints, setting, "checkpoint.pth")
+        best_model_path = os.path.join(checkpoint_dir, "checkpoint.pth")
         self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
         return self.model
 
@@ -327,15 +362,17 @@ class TokenLLM_Main(Exp_Basic):
             setting = build_setting(self.args)
 
         if load_checkpoint:
-            checkpoint_path = checkpoint_path or os.path.join(
-                self.args.checkpoints, setting, "checkpoint.pth"
-            )
+            checkpoint_path = self._resolve_checkpoint_path(setting, checkpoint_path=checkpoint_path)
             if not os.path.exists(checkpoint_path):
                 raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
+            self.run_dir = os.path.dirname(checkpoint_path)
+            if self.run_dt is None:
+                self.run_dt = datetime.now()
             self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
         else:
             print("Skipping checkpoint load and evaluating current model weights.")
+            self._ensure_run_dir(setting)
 
         test_data, test_loader = self._get_data(flag="test")
         criterion = self._select_criterion()
@@ -345,7 +382,8 @@ class TokenLLM_Main(Exp_Basic):
 
         print(f"Test Loss {loss:.5f} MSE {mse:.5f} MAE {mae:.5f}")
 
-        results_dir, run_dt = self._build_results_dir(setting)
+        results_dir = self._ensure_run_dir(setting)
+        run_dt = self.run_dt or datetime.now()
         np.save(os.path.join(results_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(results_dir, "pred.npy"), preds)
         np.save(os.path.join(results_dir, "true.npy"), trues)
