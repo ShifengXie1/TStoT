@@ -5,10 +5,10 @@ export ROOT_PATH="./data/ETT"
 export DATA_PATH="ETTh1.csv"
 
 export SEQ_LEN=96
-export PATCH_SIZE=8
-export STRIDE=4
+export PATCH_SIZE=4
+export STRIDE=2
 export VOCAB_SIZE=128
-export D_MODEL=128
+export D_MODEL=256
 export N_LAYERS=4
 export N_HEADS=4
 export DROPOUT=0.1
@@ -24,13 +24,13 @@ export GPT_LOCAL_FILES_ONLY=true
 export BATCH_SIZE=32
 export LEARNING_RATE=0.0001
 export WEIGHT_DECAY=0.0001
-export TRAIN_EPOCHS=30
-export PATIENCE=3
+export TRAIN_EPOCHS=50
+export PATIENCE=10
 export LRADJ="type3"
 
-export ALPHA=0.2
-export BETA=0.3
-export GAMMA=0.02
+export ALPHA=0.1
+export BETA=0.1
+export GAMMA=0.0
 export MAX_GRAD_NORM=1.0
 
 export USE_MULTIVARIATE=false

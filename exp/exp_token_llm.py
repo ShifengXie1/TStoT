@@ -232,7 +232,7 @@ class TokenLLM_Main(Exp_Basic):
 
     def _run_loader(self, data_set, data_loader, criterion, train_mode):
         losses = []
-        preds, trues = [], []
+        preds_scaled, trues_scaled = [], []
 
         self.model.train() if train_mode else self.model.eval()
 
@@ -246,13 +246,15 @@ class TokenLLM_Main(Exp_Basic):
                 )
 
                 losses.append(total_loss.item())
-                preds.append(forecast.detach().cpu())
-                trues.append(target.detach().cpu())
+                preds_scaled.append(forecast.detach().cpu())
+                trues_scaled.append(target.detach().cpu())
 
-        preds = torch.cat(preds).numpy()
-        trues = torch.cat(trues).numpy()
-        preds = self._inverse_transform_array(data_set, preds)
-        trues = self._inverse_transform_array(data_set, trues)
+        preds_scaled = torch.cat(preds_scaled).numpy()
+        trues_scaled = torch.cat(trues_scaled).numpy()
+
+        # Metrics are reported on inverse-transformed real values, not on normalized tensors.
+        preds = self._inverse_transform_array(data_set, preds_scaled)
+        trues = self._inverse_transform_array(data_set, trues_scaled)
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         return float(np.mean(losses)), mae, mse, preds, trues, rmse, mape, mspe
 
