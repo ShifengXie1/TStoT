@@ -170,6 +170,17 @@ class TokenLLM_Main(Exp_Basic):
     def _select_criterion(self):
         return torch.nn.MSELoss()
 
+    @staticmethod
+    def _inverse_transform_array(data_set, array):
+        scaler = getattr(data_set, "scaler", None)
+        if scaler is None:
+            return array
+
+        original_shape = array.shape
+        flattened = array.reshape(-1, original_shape[-1])
+        restored = scaler.inverse_transform(flattened)
+        return restored.reshape(original_shape)
+
     def _process_one_batch(self, batch_x, batch_y, teacher_forcing):
         batch_x = batch_x.float().to(self.device)
         batch_y = batch_y.float().to(self.device)
@@ -219,7 +230,7 @@ class TokenLLM_Main(Exp_Basic):
         )
         return total_loss
 
-    def _run_loader(self, data_loader, criterion, train_mode):
+    def _run_loader(self, data_set, data_loader, criterion, train_mode):
         losses = []
         preds, trues = [], []
 
@@ -240,13 +251,14 @@ class TokenLLM_Main(Exp_Basic):
 
         preds = torch.cat(preds).numpy()
         trues = torch.cat(trues).numpy()
+        preds = self._inverse_transform_array(data_set, preds)
+        trues = self._inverse_transform_array(data_set, trues)
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         return float(np.mean(losses)), mae, mse, preds, trues, rmse, mape, mspe
 
     def vali(self, vali_data, vali_loader, criterion):
-        del vali_data
         loss, mae, mse, preds, trues, rmse, mape, mspe = self._run_loader(
-            vali_loader, criterion, train_mode=False
+            vali_data, vali_loader, criterion, train_mode=False
         )
         self.model.train()
         return loss, mae, mse, preds, trues, rmse, mape, mspe
