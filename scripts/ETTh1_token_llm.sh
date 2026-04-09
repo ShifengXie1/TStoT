@@ -39,7 +39,7 @@ export NUM_WORKERS=0
 export FREQ="h"
 export SEED=42
 
-for PRED_LEN in 96 192 336 720; do
+for PRED_LEN in 96 ; do
     python -u run.py \
     --is_training 1 \
     --model token_llm_forecasting \
