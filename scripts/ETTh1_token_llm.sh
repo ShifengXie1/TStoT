@@ -25,7 +25,7 @@ export BATCH_SIZE=32
 export LEARNING_RATE=0.0001
 export WEIGHT_DECAY=0.0001
 export TRAIN_EPOCHS=50
-export PATIENCE=10
+export PATIENCE=3
 export LRADJ="type3"
 
 export ALPHA=0.1
