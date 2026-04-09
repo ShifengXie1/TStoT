@@ -21,6 +21,8 @@ class TokenLLMForecasting(nn.Module):
         self.n_layers = configs.n_layers
         self.n_heads = configs.n_heads
         self.dropout = getattr(configs, "dropout", 0.1)
+        self.use_instance_norm = getattr(configs, "use_instance_norm", True)
+        self.decode_temperature = getattr(configs, "decode_temperature", 1.0)
 
         self.in_channels = configs.c_in
         self.out_channels = configs.c_out
@@ -63,6 +65,22 @@ class TokenLLMForecasting(nn.Module):
         remaining = max(0, length - self.patch_size)
         return 1 + (remaining + self.stride - 1) // self.stride
 
+    def _normalize_inputs(self, x, y=None):
+        if not self.use_instance_norm:
+            return x, y, None, None
+
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-5)
+        x_norm = (x - mean) / std
+        y_norm = None if y is None else (y - mean) / std
+        return x_norm, y_norm, mean, std
+
+    @staticmethod
+    def _denormalize_output(seq, mean, std):
+        if seq is None or mean is None or std is None:
+            return seq
+        return seq * std + mean
+
     def forward(self, x, y=None, teacher_forcing=True):
         """
         x: [B, seq_len, C]
@@ -74,13 +92,15 @@ class TokenLLMForecasting(nn.Module):
           recon: [B, L_recon, C]
           aux: dict
         """
-        past_token_ids, _, past_quantized_emb, vq_loss_past = self.tokenizer(x)
+        x_in, y_in, mean, std = self._normalize_inputs(x, y)
+
+        past_token_ids, _, past_quantized_emb, vq_loss_past = self.tokenizer(x_in)
 
         future_token_ids = None
         future_quantized_emb = None
         vq_loss_future = torch.tensor(0.0, device=x.device)
-        if y is not None:
-            future_token_ids, _, future_quantized_emb, vq_loss_future = self.tokenizer(y)
+        if y_in is not None:
+            future_token_ids, _, future_quantized_emb, vq_loss_future = self.tokenizer(y_in)
 
         pred_steps = self._num_patches(self.pred_len)
         token_logits, pred_token_ids, token_loss = self.token_forecaster(
@@ -90,24 +110,28 @@ class TokenLLMForecasting(nn.Module):
             teacher_forcing=teacher_forcing,
         )
 
-        if teacher_forcing and token_logits is not None and future_token_ids is not None:
+        if token_logits is not None:
             forecast, _ = self.detokenizer.logits_to_sequence(
                 token_logits,
                 target_len=self.pred_len,
+                temperature=self.decode_temperature,
             )
         else:
             forecast, _ = self.detokenizer(pred_token_ids, target_len=self.pred_len)
+        forecast = self._denormalize_output(forecast, mean, std)
 
         recon_past, _ = self.detokenizer.embeddings_to_sequence(
             past_quantized_emb,
             target_len=self.seq_len,
         )
+        recon_past = self._denormalize_output(recon_past, mean, std)
         recon_future = None
         if future_quantized_emb is not None:
             recon_future, _ = self.detokenizer.embeddings_to_sequence(
                 future_quantized_emb,
                 target_len=self.pred_len,
             )
+            recon_future = self._denormalize_output(recon_future, mean, std)
 
         aux = {
             "past_token_ids": past_token_ids,

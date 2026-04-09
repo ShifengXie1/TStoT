@@ -6,12 +6,14 @@ export DATA_PATH="ETTh1.csv"
 
 export SEQ_LEN=96
 export PATCH_SIZE=8
-export STRIDE=8
+export STRIDE=4
 export VOCAB_SIZE=128
 export D_MODEL=128
 export N_LAYERS=4
 export N_HEADS=4
 export DROPOUT=0.1
+export USE_INSTANCE_NORM=true
+export DECODE_TEMPERATURE=0.8
 export GPT_MODEL_NAME="openai-community/gpt2"
 export GPT_LOCAL_PATH="./gpt"
 export USE_PRETRAINED_GPT2=false
@@ -53,6 +55,8 @@ for PRED_LEN in 96 192 336 720; do
     --n_layers $N_LAYERS \
     --n_heads $N_HEADS \
     --dropout $DROPOUT \
+    --use_instance_norm $USE_INSTANCE_NORM \
+    --decode_temperature $DECODE_TEMPERATURE \
     --gpt_model_name $GPT_MODEL_NAME \
     --gpt_local_path $GPT_LOCAL_PATH \
     --use_pretrained_gpt2 $USE_PRETRAINED_GPT2 \

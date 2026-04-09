@@ -54,6 +54,8 @@ def build_args():
     parser.add_argument("--n_layers", type=int, default=4)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--use_instance_norm", type=str2bool, default=True)
+    parser.add_argument("--decode_temperature", type=float, default=0.8)
     parser.add_argument("--gpt_model_name", type=str, default="openai-community/gpt2")
     parser.add_argument("--gpt_local_path", type=str, default="./gpt")
     parser.add_argument("--use_pretrained_gpt2", type=str2bool, default=False)
