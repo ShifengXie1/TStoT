@@ -23,6 +23,7 @@ class TokenLLMForecasting(nn.Module):
         self.dropout = getattr(configs, "dropout", 0.1)
         self.use_instance_norm = getattr(configs, "use_instance_norm", True)
         self.decode_temperature = getattr(configs, "decode_temperature", 1.0)
+        self.use_linear_shortcut = getattr(configs, "use_linear_shortcut", True)
 
         self.in_channels = configs.c_in
         self.out_channels = configs.c_out
@@ -58,6 +59,10 @@ class TokenLLMForecasting(nn.Module):
             out_channels=self.out_channels,
             d_model=self.d_model,
         )
+
+        if self.use_linear_shortcut:
+            # A DLinear-style shortcut helps recover local amplitude that discrete tokens may smooth out.
+            self.linear_shortcut = nn.Linear(self.seq_len, self.pred_len)
 
     def _num_patches(self, length):
         if length < self.patch_size:
@@ -118,6 +123,10 @@ class TokenLLMForecasting(nn.Module):
             )
         else:
             forecast, _ = self.detokenizer(pred_token_ids, target_len=self.pred_len)
+
+        if self.use_linear_shortcut:
+            shortcut = self.linear_shortcut(x_in.transpose(1, 2)).transpose(1, 2)
+            forecast = forecast + shortcut
         forecast = self._denormalize_output(forecast, mean, std)
 
         recon_past, _ = self.detokenizer.embeddings_to_sequence(

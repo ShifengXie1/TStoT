@@ -14,6 +14,7 @@ export N_HEADS=4
 export DROPOUT=0.1
 export USE_INSTANCE_NORM=true
 export DECODE_TEMPERATURE=0.8
+export USE_LINEAR_SHORTCUT=true
 export GPT_MODEL_NAME="openai-community/gpt2"
 export GPT_LOCAL_PATH="./gpt"
 export USE_PRETRAINED_GPT2=false
@@ -24,12 +25,12 @@ export BATCH_SIZE=32
 export LEARNING_RATE=0.0001
 export WEIGHT_DECAY=0.0001
 export TRAIN_EPOCHS=30
-export PATIENCE=6
+export PATIENCE=3
 export LRADJ="type3"
 
-export ALPHA=0.3
-export BETA=1.0
-export GAMMA=0.05
+export ALPHA=0.2
+export BETA=0.3
+export GAMMA=0.02
 export MAX_GRAD_NORM=1.0
 
 export USE_MULTIVARIATE=false
@@ -57,6 +58,7 @@ for PRED_LEN in 96 ; do
     --dropout $DROPOUT \
     --use_instance_norm $USE_INSTANCE_NORM \
     --decode_temperature $DECODE_TEMPERATURE \
+    --use_linear_shortcut $USE_LINEAR_SHORTCUT \
     --gpt_model_name $GPT_MODEL_NAME \
     --gpt_local_path $GPT_LOCAL_PATH \
     --use_pretrained_gpt2 $USE_PRETRAINED_GPT2 \
