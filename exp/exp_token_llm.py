@@ -6,11 +6,10 @@ from glob import glob
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
-from models.token_llm_forecasting import TokenLLMForecasting
+from model.ct_gpt2 import CTGPT2Forecasting
 from utils.metrics import metric
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 
@@ -18,8 +17,7 @@ from utils.tools import EarlyStopping, adjust_learning_rate, visual
 def build_setting(args):
     return (
         f"{args.model}_{args.data}_sl{args.seq_len}_pl{args.pred_len}_"
-        f"ps{args.patch_size}_st{args.stride}_dm{args.d_model}_v{args.vocab_size}_"
-        f"predgpt2"
+        f"dm{args.d_model}_nl{args.n_layers}_nh{args.n_heads}_ctgpt2"
     )
 
 
@@ -72,7 +70,7 @@ class TokenLLM_Main(Exp_Basic):
             args.use_amp = False
 
     def _build_model(self):
-        model = TokenLLMForecasting(self.args).float()
+        model = CTGPT2Forecasting(self.args).float()
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
@@ -139,13 +137,11 @@ class TokenLLM_Main(Exp_Basic):
             f"seq_len={self.args.seq_len} "
             f"pred_len={self.args.pred_len}"
             f"\n"
-            f"patch_size={self.args.patch_size} "
-            f"\n"
-            f"stride={self.args.stride} "
-            f"\n"
             f"d_model={self.args.d_model} "
             f"\n"
-            f"vocab_size={self.args.vocab_size} "
+            f"n_layers={self.args.n_layers} "
+            f"\n"
+            f"n_heads={self.args.n_heads} "
             f"\n"
             f"mse={metrics_dict['mse']:.5f} "
             f"mae={metrics_dict['mae']:.5f} "
@@ -167,9 +163,6 @@ class TokenLLM_Main(Exp_Basic):
             weight_decay=self.args.weight_decay,
         )
 
-    def _select_criterion(self):
-        return torch.nn.MSELoss()
-
     @staticmethod
     def _inverse_transform_array(data_set, array):
         scaler = getattr(data_set, "scaler", None)
@@ -181,56 +174,122 @@ class TokenLLM_Main(Exp_Basic):
         restored = scaler.inverse_transform(flattened)
         return restored.reshape(original_shape)
 
-    def _process_one_batch(self, batch_x, batch_y, teacher_forcing):
+    def _forward_ct_gpt2_batch(self, batch_x, batch_y, teacher_forcing):
+        """
+        Modular CT-GPT2 forward for one batch.
+
+        The underlying model performs:
+        1. ContinuousEmbedding on standardized scalar inputs.
+        2. Optional AlignmentModule refinement with contrastive / trend losses.
+        3. GPT-2 backbone forward via `inputs_embeds`.
+        4. Output decoder mapping hidden states to `mu` and `log_sigma2`.
+        """
         batch_x = batch_x.float().to(self.device)
         batch_y = batch_y.float().to(self.device)
-
         if self.args.use_amp:
             with torch.amp.autocast(device_type="cuda"):
-                forecast, token_logits, _, recon, aux = self.model(
-                    batch_x, batch_y, teacher_forcing=teacher_forcing
-                )
+                forecast, _, _, _, aux = self.model(batch_x, batch_y, teacher_forcing=teacher_forcing)
         else:
-            forecast, token_logits, _, recon, aux = self.model(
-                batch_x, batch_y, teacher_forcing=teacher_forcing
-            )
+            forecast, _, _, _, aux = self.model(batch_x, batch_y, teacher_forcing=teacher_forcing)
 
-        return batch_x, forecast, batch_y, token_logits, recon, aux
+        return {
+            "target": batch_y,
+            "forecast": forecast,
+            "mu": aux.get("mu"),
+            "log_sigma2": aux.get("log_sigma2"),
+            "mixture_logits": aux.get("mixture_logits"),
+            "mixture_probs": aux.get("mixture_probs"),
+            "distribution_loss": aux.get("distribution_loss"),
+            "con_loss": aux.get("con_loss", forecast.new_tensor(0.0)),
+            "trend_loss": aux.get("trend_loss", forecast.new_tensor(0.0)),
+            "hidden_states": aux.get("hidden_states"),
+            "embeddings": aux.get("embeddings"),
+            "aligned_embeddings": aux.get("aligned_embeddings"),
+            "sample_paths": aux.get("sample_paths"),
+            "mean_paths": aux.get("mean_paths"),
+        }
 
-    def _compute_total_loss(self, criterion, history, forecast, token_logits, recon, aux, target):
-        forecast_loss = criterion(forecast, target)
+    def _compute_ct_gpt2_losses(self, outputs):
+        """
+        Compute weighted CT-GPT2 training loss.
 
-        recon_terms = []
-        recon_past = aux.get("recon_past")
-        if recon_past is not None:
-            recon_terms.append(criterion(recon_past, history))
-        if recon is not None:
-            recon_terms.append(criterion(recon, target))
-        recon_loss = torch.stack(recon_terms).mean() if recon_terms else torch.tensor(
-            0.0, device=target.device
-        )
+        Total loss:
+            lambda_pred * pred_loss
+          + lambda_con * con_loss
+          + lambda_trend * trend_loss
+        """
+        target = outputs["target"]
+        pred_loss = outputs.get("distribution_loss")
+        if pred_loss is None:
+            mu = outputs["mu"]
+            log_sigma2 = outputs["log_sigma2"]
+            pred_loss = 0.5 * (
+                log_sigma2 + (target - mu) ** 2 * torch.exp(-log_sigma2)
+            ).mean()
 
-        token_ce = aux.get("token_loss")
-        future_token_ids = aux.get("future_token_ids")
-        if token_ce is None:
-            token_ce = torch.tensor(0.0, device=target.device)
+        con_loss = outputs.get("con_loss")
+        if con_loss is None:
+            con_loss = pred_loss.new_tensor(0.0)
 
-        if future_token_ids is not None and token_logits is not None and aux.get("token_loss") is None:
-            token_ce = F.cross_entropy(
-                token_logits.reshape(-1, token_logits.size(-1)),
-                future_token_ids.reshape(-1),
-            )
+        trend_loss = outputs.get("trend_loss")
+        if trend_loss is None:
+            trend_loss = pred_loss.new_tensor(0.0)
 
-        vq_loss = aux["vq_loss"]
         total_loss = (
-            forecast_loss
-            + self.args.alpha * recon_loss
-            + self.args.beta * token_ce
-            + self.args.gamma * vq_loss
+            self.args.lambda_pred * pred_loss
+            + self.args.lambda_con * con_loss
+            + self.args.lambda_trend * trend_loss
         )
-        return total_loss
+        return {
+            "loss": total_loss,
+            "pred_loss": pred_loss,
+            "con_loss": con_loss,
+            "trend_loss": trend_loss,
+        }
 
-    def _run_loader(self, data_set, data_loader, criterion, train_mode):
+    def _train_step(self, batch_x, batch_y, optimizer, scaler=None):
+        """
+        One standard PyTorch training step:
+        model.train() -> zero_grad() -> forward -> backward -> optimizer.step().
+        """
+        optimizer.zero_grad(set_to_none=True)
+        outputs = self._forward_ct_gpt2_batch(batch_x, batch_y, teacher_forcing=True)
+        loss_dict = self._compute_ct_gpt2_losses(outputs)
+        total_loss = loss_dict["loss"]
+
+        if self.args.use_amp and scaler is not None:
+            scaler.scale(total_loss).backward()
+            if self.args.max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total_loss.backward()
+            if self.args.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+            optimizer.step()
+
+        metrics = {
+            "loss": float(total_loss.detach().item()),
+            "pred_loss": float(loss_dict["pred_loss"].detach().item()),
+            "con_loss": float(loss_dict["con_loss"].detach().item()),
+            "trend_loss": float(loss_dict["trend_loss"].detach().item()),
+        }
+        return outputs, metrics
+
+    def _train_epoch(self, train_loader, optimizer, scaler=None):
+        self.model.train()
+        running = {"loss": [], "pred_loss": [], "con_loss": [], "trend_loss": []}
+
+        for batch_x, batch_y in train_loader:
+            _, step_metrics = self._train_step(batch_x, batch_y, optimizer, scaler=scaler)
+            for key in running:
+                running[key].append(step_metrics[key])
+
+        return {key: float(np.mean(values)) if values else 0.0 for key, values in running.items()}
+
+    def _run_loader(self, data_set, data_loader, train_mode):
         losses = []
         preds_scaled, trues_scaled = [], []
 
@@ -238,13 +297,15 @@ class TokenLLM_Main(Exp_Basic):
 
         with torch.set_grad_enabled(train_mode):
             for batch_x, batch_y in data_loader:
-                history, forecast, target, token_logits, recon, aux = self._process_one_batch(
-                    batch_x, batch_y, teacher_forcing=train_mode
+                outputs = self._forward_ct_gpt2_batch(
+                    batch_x,
+                    batch_y,
+                    teacher_forcing=train_mode,
                 )
-                total_loss = self._compute_total_loss(
-                    criterion, history, forecast, token_logits, recon, aux, target
-                )
-
+                loss_dict = self._compute_ct_gpt2_losses(outputs)
+                forecast = outputs["forecast"]
+                target = outputs["target"]
+                total_loss = loss_dict["loss"]
                 losses.append(total_loss.item())
                 preds_scaled.append(forecast.detach().cpu())
                 trues_scaled.append(target.detach().cpu())
@@ -258,9 +319,9 @@ class TokenLLM_Main(Exp_Basic):
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         return float(np.mean(losses)), mae, mse, preds, trues, rmse, mape, mspe
 
-    def vali(self, vali_data, vali_loader, criterion):
+    def vali(self, vali_data, vali_loader):
         loss, mae, mse, preds, trues, rmse, mape, mspe = self._run_loader(
-            vali_data, vali_loader, criterion, train_mode=False
+            vali_data, vali_loader, train_mode=False
         )
         self.model.train()
         return loss, mae, mse, preds, trues, rmse, mape, mspe
@@ -277,45 +338,14 @@ class TokenLLM_Main(Exp_Basic):
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
         model_optim = self._select_optimizer()
-        criterion = self._select_criterion()
         scaler = torch.amp.GradScaler(device="cuda", init_scale=1024) if self.args.use_amp else None
 
         for epoch in range(self.args.train_epochs):
             epoch_time = time.time()
-            train_losses = []
-            self.model.train()
-
-            for batch_x, batch_y in train_loader:
-                model_optim.zero_grad(set_to_none=True)
-                history, forecast, target, token_logits, recon, aux = self._process_one_batch(
-                    batch_x, batch_y, teacher_forcing=True
-                )
-                total_loss = self._compute_total_loss(
-                    criterion, history, forecast, token_logits, recon, aux, target
-                )
-
-                if self.args.use_amp:
-                    scaler.scale(total_loss).backward()
-                    if self.args.max_grad_norm > 0:
-                        scaler.unscale_(model_optim)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
-                    scaler.step(model_optim)
-                    scaler.update()
-                else:
-                    total_loss.backward()
-                    if self.args.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
-                    model_optim.step()
-
-                train_losses.append(total_loss.item())
-
-            train_loss = float(np.mean(train_losses))
-            vali_loss, vali_mae, _, _, _, _, _, _ = self.vali(
-                vali_data, vali_loader, criterion
-            )
-            test_loss, test_mae, test_mse, _, _, _, _, _ = self.vali(
-                None, test_loader, criterion
-            )
+            train_metrics = self._train_epoch(train_loader, model_optim, scaler=scaler)
+            train_loss = train_metrics["loss"]
+            vali_loss, vali_mae, _, _, _, _, _, _ = self.vali(vali_data, vali_loader)
+            test_loss, test_mae, test_mse, _, _, _, _, _ = self.vali(None, test_loader)
 
             if test_loss < self.min_test_loss:
                 self.min_test_loss = test_loss
@@ -330,11 +360,15 @@ class TokenLLM_Main(Exp_Basic):
                     raise optuna.exceptions.TrialPruned()
 
             print(
-                "Epoch {0}: Steps-{1} | Train Loss: {2:.5f} Vali.Loss: {3:.5f} "
-                "Vali.MAE: {4:.5f} Test.MSE: {5:.5f} Test.MAE: {6:.5f} | {7:.2f}s".format(
+                "Epoch {0}: Steps-{1} | Train Loss: {2:.5f} Pred: {3:.5f} "
+                "Con: {4:.5f} Trend: {5:.5f} Vali.Loss: {6:.5f} "
+                "Vali.MAE: {7:.5f} Test.MSE: {8:.5f} Test.MAE: {9:.5f} | {10:.2f}s".format(
                     epoch + 1,
                     train_steps,
                     train_loss,
+                    train_metrics["pred_loss"],
+                    train_metrics["con_loss"],
+                    train_metrics["trend_loss"],
                     vali_loss,
                     vali_mae,
                     test_mse,
@@ -357,36 +391,38 @@ class TokenLLM_Main(Exp_Basic):
         self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
         return self.model
 
+    @staticmethod
+    def usage_example():
+        """
+        Small usage example for one CT-GPT2 training step.
+
+        Example:
+            batch_x = torch.randn(8, 96, 1)
+            batch_y = torch.randn(8, 24, 1)
+            outputs = model.forward_batch(batch_x, batch_y, teacher_forcing=True)
+            mu = outputs["mu"]                # [8, 24, 1]
+            log_sigma2 = outputs["log_sigma2"]  # [8, 24, 1]
+            pred_loss = outputs["distribution_loss"]
+            total_loss = (
+                lambda_pred * pred_loss
+                + lambda_con * outputs["con_loss"]
+                + lambda_trend * outputs["trend_loss"]
+            )
+            optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+        """
+        return None
+
     def _save_visualization(self, results_dir, preds, trues):
         target_idx = get_target_index(self.args) if self.args.use_multivariate else None
         y_true = select_channel(trues[0], target_idx)
         y_pred = select_channel(preds[0], target_idx)
         visual(y_true, y_pred, name=os.path.join(results_dir, "forecast.png"))
 
-    def _save_tokens(self, test_loader, results_dir):
-        batch_x, batch_y = next(iter(test_loader))
-        batch_x = batch_x.float().to(self.device)
-        batch_y = batch_y.float().to(self.device)
-
-        self.model.eval()
-        with torch.no_grad():
-            _, _, pred_token_ids, _, aux = self.model(
-                batch_x, batch_y, teacher_forcing=False
-            )
-
-        np.save(
-            os.path.join(results_dir, "tokens_past.npy"),
-            aux["past_token_ids"].detach().cpu().numpy(),
-        )
-        np.save(
-            os.path.join(results_dir, "tokens_future_pred.npy"),
-            pred_token_ids.detach().cpu().numpy(),
-        )
-        if aux["future_token_ids"] is not None:
-            np.save(
-                os.path.join(results_dir, "tokens_future_true.npy"),
-                aux["future_token_ids"].detach().cpu().numpy(),
-            )
+    def _save_tokens(self, results_dir):
+        print("Skipping token export because CT-GPT2 uses continuous embeddings.")
 
     def test(self, setting=None, checkpoint_path=None, save_tokens=True, load_checkpoint=True):
         if setting is None:
@@ -406,10 +442,7 @@ class TokenLLM_Main(Exp_Basic):
             self._build_results_dir(setting)
 
         test_data, test_loader = self._get_data(flag="test")
-        criterion = self._select_criterion()
-        loss, mae, mse, preds, trues, rmse, mape, mspe = self.vali(
-            test_data, test_loader, criterion
-        )
+        loss, mae, mse, preds, trues, rmse, mape, mspe = self.vali(test_data, test_loader)
 
         print(f"Test Loss {loss:.5f} MSE {mse:.5f} MAE {mae:.5f}")
 
@@ -421,7 +454,7 @@ class TokenLLM_Main(Exp_Basic):
         self._save_visualization(results_dir, preds, trues)
 
         if save_tokens:
-            self._save_tokens(test_loader, results_dir)
+            self._save_tokens(results_dir)
 
         self._append_results_summary(
             run_dt,
