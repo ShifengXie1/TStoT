@@ -72,7 +72,24 @@ class ContinuousGPT2Forecaster(nn.Module):
     def _get_past_length(self, past_key_values):
         if past_key_values is None:
             return 0
-        return past_key_values[0][0].size(-2)
+        if hasattr(past_key_values, "get_seq_length"):
+            try:
+                return int(past_key_values.get_seq_length())
+            except TypeError:
+                return int(past_key_values.get_seq_length(0))
+
+        if hasattr(past_key_values, "key_cache") and len(past_key_values.key_cache) > 0:
+            first_key = past_key_values.key_cache[0]
+            if first_key is not None:
+                return first_key.size(-2)
+
+        if isinstance(past_key_values, (list, tuple)) and len(past_key_values) > 0:
+            return past_key_values[0][0].size(-2)
+
+        raise TypeError(
+            "Unsupported past_key_values type for CT-GPT2 cache handling: "
+            f"{type(past_key_values).__name__}"
+        )
 
     def embed_values(self, values, past_key_values=None):
         if values.dim() == 2:
