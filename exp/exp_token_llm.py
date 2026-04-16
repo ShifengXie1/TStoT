@@ -92,6 +92,9 @@ class TokenLLM_Main(Exp_Basic):
     def _base_model(self):
         return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
+    def _get_eval_num_paths(self):
+        return max(0, int(getattr(self.args, "eval_num_sampling_paths", 0)))
+
     def _build_results_dir(self, setting):
         if self.run_dir is None:
             run_dt = datetime.now()
@@ -342,21 +345,43 @@ class TokenLLM_Main(Exp_Basic):
     def _run_loader(self, data_set, data_loader, train_mode):
         losses = []
         preds_scaled, trues_scaled = [], []
+        eval_num_paths = self._get_eval_num_paths() if not train_mode else 0
 
         self.model.train() if train_mode else self.model.eval()
 
         with torch.set_grad_enabled(train_mode):
             for batch_x, batch_y in data_loader:
+                batch_x_device = batch_x.float().to(self.device)
                 outputs = self._forward_ct_gpt2_batch(
                     batch_x,
                     batch_y,
                     teacher_forcing=train_mode,
                 )
                 loss_dict = self._compute_ct_gpt2_losses(outputs)
-                forecast = outputs["forecast"]
                 target = outputs["target"]
                 losses.append(loss_dict["loss"].item())
-                preds_scaled.append(forecast.detach().cpu())
+
+                if train_mode or eval_num_paths <= 0:
+                    preds_batch = outputs["forecast"]
+                else:
+                    model = self._base_model()
+                    if self.args.use_amp:
+                        with torch.amp.autocast(device_type="cuda"):
+                            sampled_paths, _ = model.sample_paths(
+                                batch_x_device,
+                                horizon=self.args.pred_len,
+                                num_paths=eval_num_paths,
+                            )
+                    else:
+                        sampled_paths, _ = model.sample_paths(
+                            batch_x_device,
+                            horizon=self.args.pred_len,
+                            num_paths=eval_num_paths,
+                        )
+                    # Use only the sample mean across trajectories for evaluation.
+                    preds_batch = sampled_paths.mean(dim=1)
+
+                preds_scaled.append(preds_batch.detach().cpu())
                 trues_scaled.append(target.detach().cpu())
 
         preds_scaled = torch.cat(preds_scaled).numpy()
@@ -466,74 +491,14 @@ class TokenLLM_Main(Exp_Basic):
         """
         return None
 
-    def _collect_sampling_statistics(self, data_set, data_loader, num_paths):
-        if num_paths <= 0:
-            return None
-
-        model = self._base_model()
-        all_sampled_paths = []
-        all_mean_paths = []
-        self.model.eval()
-
-        with torch.no_grad():
-            for batch_x, _ in data_loader:
-                batch_x = batch_x.float().to(self.device)
-                if self.args.use_amp:
-                    with torch.amp.autocast(device_type="cuda"):
-                        sampled_paths, mean_paths = model.sample_paths(
-                            batch_x,
-                            horizon=self.args.pred_len,
-                            num_paths=num_paths,
-                        )
-                else:
-                    sampled_paths, mean_paths = model.sample_paths(
-                        batch_x,
-                        horizon=self.args.pred_len,
-                        num_paths=num_paths,
-                    )
-
-                sampled_np = sampled_paths.detach().cpu().numpy()
-                mean_np = mean_paths.detach().cpu().numpy()
-                all_sampled_paths.append(self._inverse_transform_array(data_set, sampled_np))
-                all_mean_paths.append(self._inverse_transform_array(data_set, mean_np))
-
-        sampled_paths = np.concatenate(all_sampled_paths, axis=0)
-        mean_paths = np.concatenate(all_mean_paths, axis=0)
-        return {
-            "paths": sampled_paths,
-            "mean_paths": mean_paths,
-            "mean": sampled_paths.mean(axis=1),
-            "median": np.median(sampled_paths, axis=1),
-            "q10": np.quantile(sampled_paths, 0.10, axis=1),
-            "q25": np.quantile(sampled_paths, 0.25, axis=1),
-            "q75": np.quantile(sampled_paths, 0.75, axis=1),
-            "q90": np.quantile(sampled_paths, 0.90, axis=1),
-        }
-
-    def _save_visualization(self, results_dir, preds, trues, sampling_stats=None):
+    def _save_visualization(self, results_dir, preds, trues):
         target_idx = get_target_index(self.args) if self.args.use_multivariate else None
         y_true = np.asarray(select_channel(trues[0], target_idx))
+        y_pred = np.asarray(select_channel(preds[0], target_idx))
 
         plt.figure(figsize=(10, 4))
         plt.plot(y_true, label="GroundTruth", linewidth=2, color="#1f77b4")
-
-        if sampling_stats is None:
-            y_pred = np.asarray(select_channel(preds[0], target_idx))
-            plt.plot(y_pred, label="Prediction", linewidth=2, color="#ff7f0e")
-        else:
-            mean_pred = np.asarray(select_channel(sampling_stats["mean"][0], target_idx))
-            median_pred = np.asarray(select_channel(sampling_stats["median"][0], target_idx))
-            q10 = np.asarray(select_channel(sampling_stats["q10"][0], target_idx))
-            q25 = np.asarray(select_channel(sampling_stats["q25"][0], target_idx))
-            q75 = np.asarray(select_channel(sampling_stats["q75"][0], target_idx))
-            q90 = np.asarray(select_channel(sampling_stats["q90"][0], target_idx))
-            x_axis = np.arange(len(mean_pred))
-
-            plt.fill_between(x_axis, q10, q90, color="#ff7f0e", alpha=0.16, label="P10-P90")
-            plt.fill_between(x_axis, q25, q75, color="#ff7f0e", alpha=0.28, label="P25-P75")
-            plt.plot(mean_pred, label="Sample Mean", linewidth=2, color="#ff7f0e")
-            plt.plot(median_pred, label="Sample Median", linewidth=1.5, color="#d62728")
-
+        plt.plot(y_pred, label="Sample Mean", linewidth=2, color="#ff7f0e")
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(results_dir, "forecast.png"), bbox_inches="tight")
@@ -561,8 +526,6 @@ class TokenLLM_Main(Exp_Basic):
 
         test_data, test_loader = self._get_data(flag="test")
         loss, mae, mse, preds, trues, rmse, mape, mspe = self.vali(test_data, test_loader)
-        sampling_paths = max(10, self.args.eval_num_sampling_paths, self.args.num_sampling_paths)
-        sampling_stats = self._collect_sampling_statistics(test_data, test_loader, num_paths=sampling_paths)
 
         print(f"Test Loss {loss:.5f} MSE {mse:.5f} MAE {mae:.5f}")
 
@@ -570,16 +533,9 @@ class TokenLLM_Main(Exp_Basic):
         run_dt = self.run_dt or datetime.now()
         np.save(os.path.join(results_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(results_dir, "pred.npy"), preds)
+        np.save(os.path.join(results_dir, "sample_mean.npy"), preds)
         np.save(os.path.join(results_dir, "true.npy"), trues)
-
-        if sampling_stats is not None:
-            np.save(os.path.join(results_dir, "sample_paths.npy"), sampling_stats["paths"])
-            np.save(os.path.join(results_dir, "sample_mean.npy"), sampling_stats["mean"])
-            np.save(os.path.join(results_dir, "sample_median.npy"), sampling_stats["median"])
-            np.save(os.path.join(results_dir, "sample_q10.npy"), sampling_stats["q10"])
-            np.save(os.path.join(results_dir, "sample_q90.npy"), sampling_stats["q90"])
-
-        self._save_visualization(results_dir, preds, trues, sampling_stats=sampling_stats)
+        self._save_visualization(results_dir, preds, trues)
 
         if save_tokens:
             self._save_tokens(results_dir)
