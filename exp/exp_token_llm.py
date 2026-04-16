@@ -1,8 +1,10 @@
+import math
 import os
 import time
 from datetime import datetime
 from glob import glob
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,7 +13,9 @@ from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
 from models.ct_gpt2 import CTGPT2Forecasting
 from utils.metrics import metric
-from utils.tools import EarlyStopping, adjust_learning_rate, visual
+from utils.tools import EarlyStopping, adjust_learning_rate
+
+plt.switch_backend("agg")
 
 
 def build_setting(args):
@@ -85,6 +89,9 @@ class TokenLLM_Main(Exp_Basic):
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         return getattr(getattr(model, "forecaster", None), "hidden_size", self.args.d_model)
 
+    def _base_model(self):
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
     def _build_results_dir(self, setting):
         if self.run_dir is None:
             run_dt = datetime.now()
@@ -148,7 +155,6 @@ class TokenLLM_Main(Exp_Basic):
             f"n_layers={self.args.n_layers} "
             f"\n"
             f"n_heads={self.args.n_heads} "
-            f"\n"
             f"mse={metrics_dict['mse']:.5f} "
             f"mae={metrics_dict['mae']:.5f} "
             f"\n"
@@ -169,6 +175,27 @@ class TokenLLM_Main(Exp_Basic):
             weight_decay=self.args.weight_decay,
         )
 
+    def _select_scheduler(self, optimizer):
+        scheduler_type = getattr(self.args, "scheduler_type", "legacy").lower()
+        if scheduler_type in {"legacy", "none"}:
+            return None
+        if scheduler_type != "warmup_cosine":
+            raise ValueError(f"Unsupported scheduler_type: {self.args.scheduler_type}")
+
+        total_epochs = max(1, self.args.train_epochs)
+        warmup_epochs = min(max(0, self.args.warmup_epochs), max(0, total_epochs - 1))
+        min_lr_ratio = float(self.args.min_lr_ratio)
+
+        def lr_lambda(epoch):
+            current_epoch = epoch + 1
+            if warmup_epochs > 0 and current_epoch <= warmup_epochs:
+                return current_epoch / warmup_epochs
+            progress = (current_epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
     @staticmethod
     def _inverse_transform_array(data_set, array):
         scaler = getattr(data_set, "scaler", None)
@@ -182,13 +209,7 @@ class TokenLLM_Main(Exp_Basic):
 
     def _forward_ct_gpt2_batch(self, batch_x, batch_y, teacher_forcing):
         """
-        Modular CT-GPT2 forward for one batch.
-
-        The underlying model performs:
-        1. ContinuousEmbedding on standardized scalar inputs.
-        2. Optional AlignmentModule refinement with contrastive / trend losses.
-        3. GPT-2 backbone forward via `inputs_embeds`.
-        4. Output decoder mapping hidden states to `mu` and `log_sigma2`.
+        Forward one batch through CT-GPT2 and return all supervised outputs.
         """
         batch_x = batch_x.float().to(self.device)
         batch_y = batch_y.float().to(self.device)
@@ -205,7 +226,10 @@ class TokenLLM_Main(Exp_Basic):
             "log_sigma2": aux.get("log_sigma2"),
             "mixture_logits": aux.get("mixture_logits"),
             "mixture_probs": aux.get("mixture_probs"),
+            "delta": aux.get("delta"),
             "distribution_loss": aux.get("distribution_loss"),
+            "point_loss": aux.get("point_loss"),
+            "delta_loss": aux.get("delta_loss"),
             "con_loss": aux.get("con_loss", forecast.new_tensor(0.0)),
             "trend_loss": aux.get("trend_loss", forecast.new_tensor(0.0)),
             "hidden_states": aux.get("hidden_states"),
@@ -217,47 +241,58 @@ class TokenLLM_Main(Exp_Basic):
 
     def _compute_ct_gpt2_losses(self, outputs):
         """
-        Compute weighted CT-GPT2 training loss.
+        Robust CT-GPT2 objective.
 
         Total loss:
-            lambda_pred * pred_loss
-          + lambda_con * con_loss
+            lambda_pred  * distribution_loss
+          + lambda_point * point_loss
+          + lambda_diff  * delta_loss
+          + lambda_con   * contrastive_loss
           + lambda_trend * trend_loss
         """
         target = outputs["target"]
+        forecast = outputs["forecast"]
         pred_loss = outputs.get("distribution_loss")
         if pred_loss is None:
             mu = outputs["mu"]
             log_sigma2 = outputs["log_sigma2"]
             pred_loss = 0.5 * (
-                log_sigma2 + (target - mu) ** 2 * torch.exp(-log_sigma2)
+                math.log(2.0 * math.pi) + log_sigma2 + (target - mu) ** 2 * torch.exp(-log_sigma2)
             ).mean()
 
+        point_loss = outputs.get("point_loss")
+        if point_loss is None:
+            point_loss = torch.nn.functional.smooth_l1_loss(forecast, target)
+
+        delta_loss = outputs.get("delta_loss")
+        if delta_loss is None:
+            delta_loss = pred_loss.new_tensor(0.0)
+
         con_loss = outputs.get("con_loss")
-        if con_loss is None:
+        if con_loss is None or not (self.args.use_alignment and self.args.use_con_loss):
             con_loss = pred_loss.new_tensor(0.0)
 
         trend_loss = outputs.get("trend_loss")
-        if trend_loss is None:
+        if trend_loss is None or not (self.args.use_alignment and self.args.use_trend_loss):
             trend_loss = pred_loss.new_tensor(0.0)
 
         total_loss = (
             self.args.lambda_pred * pred_loss
+            + self.args.lambda_point * point_loss
+            + self.args.lambda_diff * delta_loss
             + self.args.lambda_con * con_loss
             + self.args.lambda_trend * trend_loss
         )
         return {
             "loss": total_loss,
             "pred_loss": pred_loss,
+            "point_loss": point_loss,
+            "delta_loss": delta_loss,
             "con_loss": con_loss,
             "trend_loss": trend_loss,
         }
 
     def _train_step(self, batch_x, batch_y, optimizer, scaler=None):
-        """
-        One standard PyTorch training step:
-        model.train() -> zero_grad() -> forward -> backward -> optimizer.step().
-        """
         optimizer.zero_grad(set_to_none=True)
         outputs = self._forward_ct_gpt2_batch(batch_x, batch_y, teacher_forcing=True)
         loss_dict = self._compute_ct_gpt2_losses(outputs)
@@ -279,6 +314,8 @@ class TokenLLM_Main(Exp_Basic):
         metrics = {
             "loss": float(total_loss.detach().item()),
             "pred_loss": float(loss_dict["pred_loss"].detach().item()),
+            "point_loss": float(loss_dict["point_loss"].detach().item()),
+            "delta_loss": float(loss_dict["delta_loss"].detach().item()),
             "con_loss": float(loss_dict["con_loss"].detach().item()),
             "trend_loss": float(loss_dict["trend_loss"].detach().item()),
         }
@@ -286,7 +323,14 @@ class TokenLLM_Main(Exp_Basic):
 
     def _train_epoch(self, train_loader, optimizer, scaler=None):
         self.model.train()
-        running = {"loss": [], "pred_loss": [], "con_loss": [], "trend_loss": []}
+        running = {
+            "loss": [],
+            "pred_loss": [],
+            "point_loss": [],
+            "delta_loss": [],
+            "con_loss": [],
+            "trend_loss": [],
+        }
 
         for batch_x, batch_y in train_loader:
             _, step_metrics = self._train_step(batch_x, batch_y, optimizer, scaler=scaler)
@@ -311,15 +355,13 @@ class TokenLLM_Main(Exp_Basic):
                 loss_dict = self._compute_ct_gpt2_losses(outputs)
                 forecast = outputs["forecast"]
                 target = outputs["target"]
-                total_loss = loss_dict["loss"]
-                losses.append(total_loss.item())
+                losses.append(loss_dict["loss"].item())
                 preds_scaled.append(forecast.detach().cpu())
                 trues_scaled.append(target.detach().cpu())
 
         preds_scaled = torch.cat(preds_scaled).numpy()
         trues_scaled = torch.cat(trues_scaled).numpy()
 
-        # Metrics are reported on inverse-transformed real values, not on normalized tensors.
         preds = self._inverse_transform_array(data_set, preds_scaled)
         trues = self._inverse_transform_array(data_set, trues_scaled)
         mae, mse, rmse, mape, mspe = metric(preds, trues)
@@ -327,7 +369,9 @@ class TokenLLM_Main(Exp_Basic):
 
     def vali(self, vali_data, vali_loader):
         loss, mae, mse, preds, trues, rmse, mape, mspe = self._run_loader(
-            vali_data, vali_loader, train_mode=False
+            vali_data,
+            vali_loader,
+            train_mode=False,
         )
         self.model.train()
         return loss, mae, mse, preds, trues, rmse, mape, mspe
@@ -336,7 +380,7 @@ class TokenLLM_Main(Exp_Basic):
         train_data, train_loader = self._get_data(flag="train")
         vali_data, vali_loader = self._get_data(flag="val")
         test_data, test_loader = self._get_data(flag="test")
-        del train_data, test_data
+        del train_data
 
         checkpoint_dir = self._build_results_dir(setting)
         print(f"Checkpoint directory: {checkpoint_dir}")
@@ -344,6 +388,7 @@ class TokenLLM_Main(Exp_Basic):
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
         model_optim = self._select_optimizer()
+        scheduler = self._select_scheduler(model_optim)
         scaler = torch.amp.GradScaler(device="cuda", init_scale=1024) if self.args.use_amp else None
 
         for epoch in range(self.args.train_epochs):
@@ -351,7 +396,7 @@ class TokenLLM_Main(Exp_Basic):
             train_metrics = self._train_epoch(train_loader, model_optim, scaler=scaler)
             train_loss = train_metrics["loss"]
             vali_loss, vali_mae, _, _, _, _, _, _ = self.vali(vali_data, vali_loader)
-            test_loss, test_mae, test_mse, _, _, _, _, _ = self.vali(None, test_loader)
+            test_loss, test_mae, test_mse, _, _, _, _, _ = self.vali(test_data, test_loader)
 
             if test_loss < self.min_test_loss:
                 self.min_test_loss = test_loss
@@ -365,20 +410,25 @@ class TokenLLM_Main(Exp_Basic):
                 if optunaTrialReport.should_prune():
                     raise optuna.exceptions.TrialPruned()
 
+            current_lr = model_optim.param_groups[0]["lr"]
             print(
-                "Epoch {0}: Steps-{1} | Train Loss: {2:.5f} Pred: {3:.5f} "
-                "Con: {4:.5f} Trend: {5:.5f} Vali.Loss: {6:.5f} "
-                "Vali.MAE: {7:.5f} Test.MSE: {8:.5f} Test.MAE: {9:.5f} | {10:.2f}s".format(
+                "Epoch {0}: Steps-{1} | Train Loss: {2:.5f} Dist: {3:.5f} "
+                "Point: {4:.5f} Delta: {5:.5f} Con: {6:.5f} Trend: {7:.5f} "
+                "Vali.Loss: {8:.5f} Vali.MAE: {9:.5f} Test.MSE: {10:.5f} "
+                "Test.MAE: {11:.5f} LR: {12:.6f} | {13:.2f}s".format(
                     epoch + 1,
                     train_steps,
                     train_loss,
                     train_metrics["pred_loss"],
+                    train_metrics["point_loss"],
+                    train_metrics["delta_loss"],
                     train_metrics["con_loss"],
                     train_metrics["trend_loss"],
                     vali_loss,
                     vali_mae,
                     test_mse,
                     test_mae,
+                    current_lr,
                     time.time() - epoch_time,
                 )
             )
@@ -391,7 +441,10 @@ class TokenLLM_Main(Exp_Basic):
                 print("Stopping: train loss is NaN")
                 break
 
-            adjust_learning_rate(model_optim, None, epoch + 1, self.args, printout=False)
+            if scheduler is not None:
+                scheduler.step()
+            else:
+                adjust_learning_rate(model_optim, None, epoch + 1, self.args, printout=False)
 
         best_model_path = os.path.join(checkpoint_dir, "checkpoint.pth")
         self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
@@ -400,32 +453,91 @@ class TokenLLM_Main(Exp_Basic):
     @staticmethod
     def usage_example():
         """
-        Small usage example for one CT-GPT2 training step.
+        Example weighted CT-GPT2 losses:
 
-        Example:
-            batch_x = torch.randn(8, 96, 1)
-            batch_y = torch.randn(8, 24, 1)
             outputs = model.forward_batch(batch_x, batch_y, teacher_forcing=True)
-            mu = outputs["mu"]                # [8, 24, 1]
-            log_sigma2 = outputs["log_sigma2"]  # [8, 24, 1]
-            pred_loss = outputs["distribution_loss"]
             total_loss = (
-                lambda_pred * pred_loss
+                lambda_pred * outputs["distribution_loss"]
+                + lambda_point * outputs["point_loss"]
+                + lambda_diff * outputs["delta_loss"]
                 + lambda_con * outputs["con_loss"]
                 + lambda_trend * outputs["trend_loss"]
             )
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
         """
         return None
 
-    def _save_visualization(self, results_dir, preds, trues):
+    def _collect_sampling_statistics(self, data_set, data_loader, num_paths):
+        if num_paths <= 0:
+            return None
+
+        model = self._base_model()
+        all_sampled_paths = []
+        all_mean_paths = []
+        self.model.eval()
+
+        with torch.no_grad():
+            for batch_x, _ in data_loader:
+                batch_x = batch_x.float().to(self.device)
+                if self.args.use_amp:
+                    with torch.amp.autocast(device_type="cuda"):
+                        sampled_paths, mean_paths = model.sample_paths(
+                            batch_x,
+                            horizon=self.args.pred_len,
+                            num_paths=num_paths,
+                        )
+                else:
+                    sampled_paths, mean_paths = model.sample_paths(
+                        batch_x,
+                        horizon=self.args.pred_len,
+                        num_paths=num_paths,
+                    )
+
+                sampled_np = sampled_paths.detach().cpu().numpy()
+                mean_np = mean_paths.detach().cpu().numpy()
+                all_sampled_paths.append(self._inverse_transform_array(data_set, sampled_np))
+                all_mean_paths.append(self._inverse_transform_array(data_set, mean_np))
+
+        sampled_paths = np.concatenate(all_sampled_paths, axis=0)
+        mean_paths = np.concatenate(all_mean_paths, axis=0)
+        return {
+            "paths": sampled_paths,
+            "mean_paths": mean_paths,
+            "mean": sampled_paths.mean(axis=1),
+            "median": np.median(sampled_paths, axis=1),
+            "q10": np.quantile(sampled_paths, 0.10, axis=1),
+            "q25": np.quantile(sampled_paths, 0.25, axis=1),
+            "q75": np.quantile(sampled_paths, 0.75, axis=1),
+            "q90": np.quantile(sampled_paths, 0.90, axis=1),
+        }
+
+    def _save_visualization(self, results_dir, preds, trues, sampling_stats=None):
         target_idx = get_target_index(self.args) if self.args.use_multivariate else None
-        y_true = select_channel(trues[0], target_idx)
-        y_pred = select_channel(preds[0], target_idx)
-        visual(y_true, y_pred, name=os.path.join(results_dir, "forecast.png"))
+        y_true = np.asarray(select_channel(trues[0], target_idx))
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(y_true, label="GroundTruth", linewidth=2, color="#1f77b4")
+
+        if sampling_stats is None:
+            y_pred = np.asarray(select_channel(preds[0], target_idx))
+            plt.plot(y_pred, label="Prediction", linewidth=2, color="#ff7f0e")
+        else:
+            mean_pred = np.asarray(select_channel(sampling_stats["mean"][0], target_idx))
+            median_pred = np.asarray(select_channel(sampling_stats["median"][0], target_idx))
+            q10 = np.asarray(select_channel(sampling_stats["q10"][0], target_idx))
+            q25 = np.asarray(select_channel(sampling_stats["q25"][0], target_idx))
+            q75 = np.asarray(select_channel(sampling_stats["q75"][0], target_idx))
+            q90 = np.asarray(select_channel(sampling_stats["q90"][0], target_idx))
+            x_axis = np.arange(len(mean_pred))
+
+            plt.fill_between(x_axis, q10, q90, color="#ff7f0e", alpha=0.16, label="P10-P90")
+            plt.fill_between(x_axis, q25, q75, color="#ff7f0e", alpha=0.28, label="P25-P75")
+            plt.plot(mean_pred, label="Sample Mean", linewidth=2, color="#ff7f0e")
+            plt.plot(median_pred, label="Sample Median", linewidth=1.5, color="#d62728")
+
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, "forecast.png"), bbox_inches="tight")
+        plt.close()
 
     def _save_tokens(self, results_dir):
         print("Skipping token export because CT-GPT2 uses continuous embeddings.")
@@ -449,6 +561,8 @@ class TokenLLM_Main(Exp_Basic):
 
         test_data, test_loader = self._get_data(flag="test")
         loss, mae, mse, preds, trues, rmse, mape, mspe = self.vali(test_data, test_loader)
+        sampling_paths = max(10, self.args.eval_num_sampling_paths, self.args.num_sampling_paths)
+        sampling_stats = self._collect_sampling_statistics(test_data, test_loader, num_paths=sampling_paths)
 
         print(f"Test Loss {loss:.5f} MSE {mse:.5f} MAE {mae:.5f}")
 
@@ -457,7 +571,15 @@ class TokenLLM_Main(Exp_Basic):
         np.save(os.path.join(results_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(results_dir, "pred.npy"), preds)
         np.save(os.path.join(results_dir, "true.npy"), trues)
-        self._save_visualization(results_dir, preds, trues)
+
+        if sampling_stats is not None:
+            np.save(os.path.join(results_dir, "sample_paths.npy"), sampling_stats["paths"])
+            np.save(os.path.join(results_dir, "sample_mean.npy"), sampling_stats["mean"])
+            np.save(os.path.join(results_dir, "sample_median.npy"), sampling_stats["median"])
+            np.save(os.path.join(results_dir, "sample_q10.npy"), sampling_stats["q10"])
+            np.save(os.path.join(results_dir, "sample_q90.npy"), sampling_stats["q90"])
+
+        self._save_visualization(results_dir, preds, trues, sampling_stats=sampling_stats)
 
         if save_tokens:
             self._save_tokens(results_dir)

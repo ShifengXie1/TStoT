@@ -32,12 +32,20 @@ class ContinuousGPT2Forecaster(nn.Module):
         min_log_variance=-10.0,
         max_log_variance=5.0,
         use_alignment=False,
+        use_contrastive_loss=True,
+        use_trend_loss=True,
         alignment_hidden_dim=None,
         contrastive_temperature=0.1,
+        alignment_dropout=0.1,
+        alignment_augmentation_std=0.02,
+        decoder_dropout=0.1,
+        use_trend_regression=True,
     ):
         super().__init__()
         self.num_sampling_paths = num_sampling_paths
         self.use_alignment = use_alignment
+        self.use_contrastive_loss = use_contrastive_loss
+        self.use_trend_loss = use_trend_loss
 
         self.backbone = GPT2BackboneWrapper(
             model_name=model_name,
@@ -59,6 +67,8 @@ class ContinuousGPT2Forecaster(nn.Module):
             d_model=self.hidden_size,
             hidden_dim=alignment_hidden_dim,
             temperature=contrastive_temperature,
+            dropout=alignment_dropout,
+            augmentation_std=alignment_augmentation_std,
         ) if use_alignment else None
         self.output_decoder = OutputDecodingModule(
             hidden_size=self.hidden_size,
@@ -67,6 +77,8 @@ class ContinuousGPT2Forecaster(nn.Module):
             num_mixtures=num_output_mixtures,
             min_log_variance=min_log_variance,
             max_log_variance=max_log_variance,
+            dropout=decoder_dropout,
+            use_trend_regression=use_trend_regression,
         )
 
     def _get_past_length(self, past_key_values):
@@ -100,7 +112,13 @@ class ContinuousGPT2Forecaster(nn.Module):
         if self.alignment_module is None:
             zero = embeddings.new_tensor(0.0)
             return embeddings, {"con_loss": zero, "trend_loss": zero}
-        return self.alignment_module(embeddings, values=values, compute_losses=compute_losses)
+        return self.alignment_module(
+            embeddings,
+            values=values,
+            compute_losses=compute_losses,
+            use_contrastive=self.use_contrastive_loss,
+            use_trend=self.use_trend_loss,
+        )
 
     def _build_attention_mask(self, values, past_key_values=None):
         if values.dim() == 2:
@@ -120,8 +138,8 @@ class ContinuousGPT2Forecaster(nn.Module):
             use_cache=use_cache,
         )
 
-    def decode_hidden_states(self, hidden_states):
-        params = self.output_decoder(hidden_states)
+    def decode_hidden_states(self, hidden_states, base_values=None):
+        params = self.output_decoder(hidden_states, base_values=base_values)
         return self.output_decoder.point_forecast(params), params
 
     def forward_components(self, values, past_key_values=None, use_cache=False, compute_alignment_losses=False):
@@ -137,7 +155,10 @@ class ContinuousGPT2Forecaster(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
         )
-        point_forecast, params = self.decode_hidden_states(backbone_outputs["last_hidden_state"])
+        point_forecast, params = self.decode_hidden_states(
+            backbone_outputs["last_hidden_state"],
+            base_values=values,
+        )
         return {
             "embeddings": embeddings,
             "aligned_embeddings": aligned_embeddings,
@@ -203,6 +224,7 @@ class ContinuousGPT2Forecaster(nn.Module):
                 use_cache=False,
                 compute_alignment_losses=self.use_alignment,
             )
+            prev_values = input_values[:, history_len - 1 :, :]
             params = {
                 key: None if value is None else value[:, history_len - 1 :, ...]
                 for key, value in outputs["params"].items()
@@ -216,7 +238,10 @@ class ContinuousGPT2Forecaster(nn.Module):
                 "log_sigma2": params["log_sigma2"],
                 "mixture_logits": params["mixture_logits"],
                 "mixture_probs": params["mixture_probs"],
+                "delta": params.get("delta"),
                 "distribution_loss": self.output_decoder.negative_log_likelihood(future_values, params),
+                "point_loss": self.output_decoder.point_loss(future_values, params),
+                "delta_loss": self.output_decoder.trend_regression_loss(future_values, prev_values, params),
                 "con_loss": outputs["con_loss"],
                 "trend_loss": outputs["trend_loss"],
                 "sample_paths": None,
@@ -232,6 +257,8 @@ class ContinuousGPT2Forecaster(nn.Module):
         log_sigma2_steps = []
         mixture_logits_steps = []
         mixture_probs_steps = []
+        delta_steps = []
+        prev_value_steps = []
         past_key_values = None
 
         for _ in range(pred_steps):
@@ -244,9 +271,12 @@ class ContinuousGPT2Forecaster(nn.Module):
             )
             past_key_values = step_outputs["past_key_values"]
             next_value = step_outputs["point_forecast"][:, -1:, :]
+            prev_value_steps.append(decoder_input[:, -1:, :])
             forecast_steps.append(next_value)
             mu_steps.append(step_outputs["params"]["mu"][:, -1:, ...])
             log_sigma2_steps.append(step_outputs["params"]["log_sigma2"][:, -1:, ...])
+            if step_outputs["params"].get("delta") is not None:
+                delta_steps.append(step_outputs["params"]["delta"][:, -1:, ...])
             if step_outputs["params"]["mixture_logits"] is not None:
                 mixture_logits_steps.append(step_outputs["params"]["mixture_logits"][:, -1:, ...])
                 mixture_probs_steps.append(step_outputs["params"]["mixture_probs"][:, -1:, ...])
@@ -256,18 +286,23 @@ class ContinuousGPT2Forecaster(nn.Module):
         log_sigma2 = torch.cat(log_sigma2_steps, dim=1)
         mixture_logits = torch.cat(mixture_logits_steps, dim=1) if mixture_logits_steps else None
         mixture_probs = torch.cat(mixture_probs_steps, dim=1) if mixture_probs_steps else None
+        delta = torch.cat(delta_steps, dim=1) if delta_steps else None
+        prev_values = torch.cat(prev_value_steps, dim=1) if prev_value_steps else None
         forecast = torch.cat(forecast_steps, dim=1)
         distribution_loss = None
+        point_loss = None
+        delta_loss = None
         if future_values is not None:
-            distribution_loss = self.output_decoder.negative_log_likelihood(
-                future_values,
-                {
-                    "mu": mu,
-                    "log_sigma2": log_sigma2,
-                    "mixture_logits": mixture_logits,
-                    "mixture_probs": mixture_probs,
-                },
-            )
+            params = {
+                "mu": mu,
+                "log_sigma2": log_sigma2,
+                "mixture_logits": mixture_logits,
+                "mixture_probs": mixture_probs,
+                "delta": delta,
+            }
+            distribution_loss = self.output_decoder.negative_log_likelihood(future_values, params)
+            point_loss = self.output_decoder.point_loss(future_values, params)
+            delta_loss = self.output_decoder.trend_regression_loss(future_values, prev_values, params)
 
         sample_paths = None
         mean_paths = None
@@ -286,7 +321,10 @@ class ContinuousGPT2Forecaster(nn.Module):
             "log_sigma2": log_sigma2,
             "mixture_logits": mixture_logits,
             "mixture_probs": mixture_probs,
+            "delta": delta,
             "distribution_loss": distribution_loss,
+            "point_loss": point_loss,
+            "delta_loss": delta_loss,
             "con_loss": forecast.new_tensor(0.0),
             "trend_loss": forecast.new_tensor(0.0),
             "sample_paths": sample_paths,

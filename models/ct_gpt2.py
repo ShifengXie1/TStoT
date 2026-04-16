@@ -41,8 +41,14 @@ class CTGPT2Forecasting(nn.Module):
             min_log_variance=getattr(configs, "min_log_variance", -10.0),
             max_log_variance=getattr(configs, "max_log_variance", 5.0),
             use_alignment=getattr(configs, "use_alignment", False),
+            use_contrastive_loss=getattr(configs, "use_con_loss", True),
+            use_trend_loss=getattr(configs, "use_trend_loss", True),
             alignment_hidden_dim=getattr(configs, "alignment_hidden_dim", None),
             contrastive_temperature=getattr(configs, "contrastive_temperature", 0.1),
+            alignment_dropout=getattr(configs, "alignment_dropout", getattr(configs, "dropout", 0.1)),
+            alignment_augmentation_std=getattr(configs, "alignment_augmentation_std", 0.02),
+            decoder_dropout=getattr(configs, "decoder_dropout", getattr(configs, "dropout", 0.1)),
+            use_trend_regression=getattr(configs, "use_trend_regression", True),
         )
         if self.use_linear_shortcut:
             self.linear_shortcut = nn.Linear(self.seq_len, self.pred_len)
@@ -84,6 +90,8 @@ class CTGPT2Forecasting(nn.Module):
                 aux["log_sigma2"],
                 self._expand_scale(scale, aux["log_sigma2"]),
             )
+        if aux.get("delta") is not None:
+            aux["delta"] = self.sample_scaler.unscale(aux["delta"], self._expand_scale(scale, aux["delta"]))
         if aux.get("sample_paths") is not None:
             aux["sample_paths"] = self.sample_scaler.unscale(aux["sample_paths"], scale.unsqueeze(1))
         if aux.get("mean_paths") is not None:
@@ -95,6 +103,13 @@ class CTGPT2Forecasting(nn.Module):
                     "mu": aux["mu"],
                     "log_sigma2": aux["log_sigma2"],
                     "mixture_logits": aux.get("mixture_logits"),
+                    "mixture_probs": aux.get("mixture_probs"),
+                },
+            )
+            aux["point_loss"] = self.forecaster.output_decoder.point_loss(
+                target,
+                {
+                    "mu": aux["mu"],
                     "mixture_probs": aux.get("mixture_probs"),
                 },
             )
@@ -121,6 +136,14 @@ class CTGPT2Forecasting(nn.Module):
                     aux["mu"] = aux["mu"] + shortcut
                 else:
                     aux["mu"] = aux["mu"] + shortcut.unsqueeze(-2)
+            if model_y is not None and aux.get("mu") is not None:
+                aux["point_loss"] = self.forecaster.output_decoder.point_loss(
+                    model_y,
+                    {
+                        "mu": aux["mu"],
+                        "mixture_probs": aux.get("mixture_probs"),
+                    },
+                )
 
         if self.use_chronos_scaling:
             forecast, aux = self._apply_inverse_scaling(forecast, aux, scale, target=y)
@@ -131,6 +154,13 @@ class CTGPT2Forecasting(nn.Module):
                     "mu": aux["mu"],
                     "log_sigma2": aux["log_sigma2"],
                     "mixture_logits": aux.get("mixture_logits"),
+                    "mixture_probs": aux.get("mixture_probs"),
+                },
+            )
+            aux["point_loss"] = self.forecaster.output_decoder.point_loss(
+                y,
+                {
+                    "mu": aux["mu"],
                     "mixture_probs": aux.get("mixture_probs"),
                 },
             )
@@ -146,7 +176,10 @@ class CTGPT2Forecasting(nn.Module):
             "log_sigma2": aux.get("log_sigma2"),
             "mixture_logits": aux.get("mixture_logits"),
             "mixture_probs": aux.get("mixture_probs"),
+            "delta": aux.get("delta"),
             "distribution_loss": aux.get("distribution_loss"),
+            "point_loss": aux.get("point_loss"),
+            "delta_loss": aux.get("delta_loss"),
             "con_loss": aux.get("con_loss", forecast.new_tensor(0.0)),
             "trend_loss": aux.get("trend_loss", forecast.new_tensor(0.0)),
             "hidden_states": aux.get("hidden_states"),
