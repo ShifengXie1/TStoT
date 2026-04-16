@@ -41,7 +41,7 @@ def build_args():
     parser.add_argument("--save_tokens", type=str2bool, default=True)
     parser.add_argument("--zero_shot", type=str2bool, default=False)
     parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--model", type=str, default="token_llm_forecasting")
+    parser.add_argument("--model", type=str, default="ct_gpt2")
     parser.add_argument("--data", type=str, default="ETTh1")
     parser.add_argument("--root_path", type=str, default="./data/ETT")
     parser.add_argument("--data_path", type=str, default="ETTh1.csv")
@@ -110,6 +110,11 @@ def build_args():
     args.target = args.target_col
     args.c_in = infer_num_channels(args)
     args.c_out = args.c_in if args.use_multivariate else 1
+    if args.use_multivariate:
+        raise ValueError(
+            "The current CT-GPT2 implementation only supports univariate inputs. "
+            "Please run with `--use_multivariate false`."
+        )
     return args
 
 

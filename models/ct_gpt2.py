@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from model.chronos_scaler import ChronosMeanScaler
-from model.ct_gpt2_forecaster import ContinuousGPT2Forecaster
+from models.chronos_scaler import ChronosMeanScaler
+from models.ct_gpt2_forecaster import ContinuousGPT2Forecaster
 
 
 class CTGPT2Forecasting(nn.Module):
@@ -46,6 +46,26 @@ class CTGPT2Forecasting(nn.Module):
         )
         if self.use_linear_shortcut:
             self.linear_shortcut = nn.Linear(self.seq_len, self.pred_len)
+
+    def _compute_shortcut(self, model_x, horizon=None):
+        """
+        Compute the deterministic linear shortcut on the model-space inputs.
+
+        The shortcut head is trained for exactly `pred_len` future steps. To
+        keep stochastic path sampling consistent with the main forward pass, we
+        only apply it when the requested horizon matches `pred_len`.
+        """
+        if not self.use_linear_shortcut:
+            return None
+
+        horizon = self.pred_len if horizon is None else horizon
+        if horizon != self.pred_len:
+            raise ValueError(
+                "CT-GPT2 linear shortcut is defined for pred_len steps only. "
+                f"Received horizon={horizon}, pred_len={self.pred_len}."
+            )
+
+        return self.linear_shortcut(model_x.transpose(1, 2)).transpose(1, 2)
 
     @staticmethod
     def _expand_scale(scale, tensor):
@@ -93,8 +113,8 @@ class CTGPT2Forecasting(nn.Module):
             teacher_forcing=teacher_forcing,
         )
 
-        if self.use_linear_shortcut:
-            shortcut = self.linear_shortcut(model_x.transpose(1, 2)).transpose(1, 2)
+        shortcut = self._compute_shortcut(model_x) if self.use_linear_shortcut else None
+        if shortcut is not None:
             forecast = forecast + shortcut
             if aux.get("mu") is not None:
                 if aux.get("mixture_logits") is None:
@@ -145,6 +165,11 @@ class CTGPT2Forecasting(nn.Module):
         if self.use_chronos_scaling:
             model_x, _, scale = self.sample_scaler.scale(x, None)
         sampled_paths, mean_paths = self.forecaster.generate_sampling_paths(model_x, horizon, num_paths)
+        shortcut = self._compute_shortcut(model_x, horizon=horizon) if self.use_linear_shortcut else None
+        if shortcut is not None:
+            shortcut = shortcut.unsqueeze(1)
+            sampled_paths = sampled_paths + shortcut
+            mean_paths = mean_paths + shortcut
         if self.use_chronos_scaling:
             sampled_paths = self.sample_scaler.unscale(sampled_paths, scale.unsqueeze(1))
             mean_paths = self.sample_scaler.unscale(mean_paths, scale.unsqueeze(1))

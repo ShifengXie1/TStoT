@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
-from model.ct_gpt2 import CTGPT2Forecasting
+from models.ct_gpt2 import CTGPT2Forecasting
 from utils.metrics import metric
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 
@@ -81,6 +81,10 @@ class TokenLLM_Main(Exp_Basic):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
 
+    def _get_runtime_hidden_size(self):
+        model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        return getattr(getattr(model, "forecaster", None), "hidden_size", self.args.d_model)
+
     def _build_results_dir(self, setting):
         if self.run_dir is None:
             run_dt = datetime.now()
@@ -138,6 +142,8 @@ class TokenLLM_Main(Exp_Basic):
             f"pred_len={self.args.pred_len}"
             f"\n"
             f"d_model={self.args.d_model} "
+            f"\n"
+            f"runtime_hidden_size={self._get_runtime_hidden_size()} "
             f"\n"
             f"n_layers={self.args.n_layers} "
             f"\n"

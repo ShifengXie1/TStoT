@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 
-from model.alignment_module import AlignmentModule
-from model.continuous_embedding import ContinuousEmbedding
-from model.gpt2_backbone import GPT2BackboneWrapper
-from model.output_decoder import OutputDecodingModule
+from models.alignment_module import AlignmentModule
+from models.continuous_embedding import ContinuousEmbedding
+from models.gpt2_backbone import GPT2BackboneWrapper
+from models.output_decoder import OutputDecodingModule
 
 
 class ContinuousGPT2Forecaster(nn.Module):
