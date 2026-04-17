@@ -8,6 +8,10 @@ from models.ct_gpt2_forecaster import ContinuousGPT2Forecaster
 class CTGPT2Forecasting(nn.Module):
     """
     Complete CT-GPT2 model with optional Chronos-style sample scaling.
+
+    The wrapped forecaster returns both prediction outputs and optional
+    alignment-side losses (`con_loss`, `trend_loss`) so the training loop can
+    optimize forecasting and embedding alignment jointly.
     """
 
     def __init__(self, configs):
@@ -49,9 +53,17 @@ class CTGPT2Forecasting(nn.Module):
             alignment_augmentation_std=getattr(configs, "alignment_augmentation_std", 0.02),
             decoder_dropout=getattr(configs, "decoder_dropout", getattr(configs, "dropout", 0.1)),
             use_trend_regression=getattr(configs, "use_trend_regression", True),
+            freeze_gpt2=getattr(configs, "freeze_gpt2", True),
+            gpt2_trainable_layers=getattr(configs, "gpt2_trainable_layers", 1),
         )
         if self.use_linear_shortcut:
             self.linear_shortcut = nn.Linear(self.seq_len, self.pred_len)
+
+    def get_gpt2_trainability_report(self):
+        """
+        Expose the backbone freeze/partial-finetune summary to the trainer.
+        """
+        return self.forecaster.get_gpt2_trainability_report()
 
     def _compute_shortcut(self, model_x, horizon=None):
         """
@@ -127,6 +139,8 @@ class CTGPT2Forecasting(nn.Module):
             pred_steps=self.pred_len,
             teacher_forcing=teacher_forcing,
         )
+        # Alignment losses are produced inside the forecaster together with the
+        # aligned embeddings that were fed into GPT-2.
 
         shortcut = self._compute_shortcut(model_x) if self.use_linear_shortcut else None
         if shortcut is not None:

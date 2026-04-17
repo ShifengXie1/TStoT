@@ -16,6 +16,11 @@ class GPT2BackboneWrapper(nn.Module):
 
     CT-GPT2 provides `inputs_embeds` directly instead of `input_ids`. GPT-2 then
     consumes tensors with shape [batch, seq_len, hidden_size].
+
+    The wrapper also owns the backbone fine-tuning policy so training code can
+    switch between:
+    1. Fully frozen GPT-2.
+    2. Partial fine-tuning of only the last N transformer blocks plus `ln_f`.
     """
 
     def __init__(
@@ -31,6 +36,8 @@ class GPT2BackboneWrapper(nn.Module):
         n_heads=12,
         dropout=0.1,
         disable_internal_position_embeddings=False,
+        freeze_gpt2=True,
+        gpt2_trainable_layers=1,
     ):
         super().__init__()
         if GPT2Config is None or GPT2Model is None:
@@ -45,6 +52,8 @@ class GPT2BackboneWrapper(nn.Module):
         self.prefer_local = prefer_local
         self.local_files_only = local_files_only
         self.max_seq_len = max_seq_len
+        self.freeze_gpt2 = freeze_gpt2
+        self.gpt2_trainable_layers = max(0, int(gpt2_trainable_layers))
 
         resolved_model_name, resolved_local_files_only = self._resolve_pretrained_source()
         if use_pretrained:
@@ -76,6 +85,7 @@ class GPT2BackboneWrapper(nn.Module):
 
         if disable_internal_position_embeddings:
             self._disable_internal_positions()
+        self._apply_trainability_policy()
 
     def _resolve_pretrained_source(self):
         if not self.use_pretrained:
@@ -92,6 +102,76 @@ class GPT2BackboneWrapper(nn.Module):
             with torch.no_grad():
                 self.gpt2.wpe.weight.zero_()
             self.gpt2.wpe.weight.requires_grad = False
+
+    @staticmethod
+    def _set_module_trainable(module, trainable):
+        if module is None:
+            return
+        for param in module.parameters():
+            param.requires_grad = trainable
+
+    def _apply_trainability_policy(self):
+        """
+        Configure GPT-2 trainability in one place.
+
+        Policy:
+        1. `freeze_gpt2=True`: freeze the full GPT-2 backbone.
+        2. `freeze_gpt2=False`: keep only the last
+           `gpt2_trainable_layers` transformer blocks plus the final
+           layer norm trainable. The selected transformer blocks include their
+           internal attention/MLP submodules automatically.
+        """
+        total_layers = len(self.gpt2.h) if hasattr(self.gpt2, "h") else 0
+        for param in self.gpt2.parameters():
+            param.requires_grad = False
+
+        if self.freeze_gpt2:
+            self._trainability_report = {
+                "mode": "frozen",
+                "total_layers": total_layers,
+                "trainable_layers": [],
+                "frozen_layers": list(range(total_layers)),
+                "trainable_modules": [],
+                "frozen_modules": ["wte", "wpe", "h[*]", "ln_f"],
+            }
+            return
+
+        trainable_layers = []
+        num_layers = min(self.gpt2_trainable_layers, total_layers)
+        if num_layers > 0:
+            start_idx = total_layers - num_layers
+            trainable_layers = list(range(start_idx, total_layers))
+            for layer_idx in trainable_layers:
+                self._set_module_trainable(self.gpt2.h[layer_idx], True)
+
+        # In partial fine-tuning mode we also unfreeze the final normalization
+        # stage so the selected top blocks can adapt their output statistics.
+        if hasattr(self.gpt2, "ln_f") and self.gpt2.ln_f is not None:
+            self._set_module_trainable(self.gpt2.ln_f, True)
+
+        frozen_layers = [idx for idx in range(total_layers) if idx not in trainable_layers]
+        trainable_modules = [f"h.{idx}" for idx in trainable_layers]
+        if hasattr(self.gpt2, "ln_f") and self.gpt2.ln_f is not None:
+            trainable_modules.append("ln_f")
+
+        self._trainability_report = {
+            "mode": "partial",
+            "total_layers": total_layers,
+            "trainable_layers": trainable_layers,
+            "frozen_layers": frozen_layers,
+            "trainable_modules": trainable_modules,
+            "frozen_modules": ["wte", "wpe"] + [f"h.{idx}" for idx in frozen_layers],
+        }
+
+    def get_trainability_report(self):
+        return dict(self._trainability_report)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_gpt2:
+            # Keep a fully frozen backbone deterministic during training.
+            self.gpt2.eval()
+        return self
 
     def forward(
         self,

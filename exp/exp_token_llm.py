@@ -75,6 +75,7 @@ class TokenLLM_Main(Exp_Basic):
 
     def _build_model(self):
         model = CTGPT2Forecasting(self.args).float()
+        self._log_gpt2_trainability(model)
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
@@ -94,6 +95,40 @@ class TokenLLM_Main(Exp_Basic):
 
     def _get_eval_num_paths(self):
         return max(0, int(getattr(self.args, "eval_num_sampling_paths", 0)))
+
+    @staticmethod
+    def _format_layer_list(layer_ids):
+        if not layer_ids:
+            return "none"
+        return ", ".join(str(layer_id) for layer_id in layer_ids)
+
+    def _log_gpt2_trainability(self, model):
+        if not hasattr(model, "get_gpt2_trainability_report"):
+            return
+
+        report = model.get_gpt2_trainability_report()
+        print(
+            "GPT-2 trainability | mode={0} | total_layers={1} | trainable_layers={2} | frozen_layers={3}".format(
+                report.get("mode", "unknown"),
+                report.get("total_layers", 0),
+                self._format_layer_list(report.get("trainable_layers", [])),
+                self._format_layer_list(report.get("frozen_layers", [])),
+            )
+        )
+        print(
+            "GPT-2 modules | trainable={0} | frozen={1}".format(
+                ", ".join(report.get("trainable_modules", [])) or "none",
+                ", ".join(report.get("frozen_modules", [])) or "none",
+            )
+        )
+
+    def _trainable_parameters(self):
+        # Optimizer/scheduler only ever see parameters that are still marked as
+        # trainable after the GPT-2 freeze policy has been applied.
+        trainable_params = [param for param in self.model.parameters() if param.requires_grad]
+        if not trainable_params:
+            raise ValueError("No trainable parameters were found for optimization.")
+        return trainable_params
 
     def _build_results_dir(self, setting):
         if self.run_dir is None:
@@ -172,8 +207,9 @@ class TokenLLM_Main(Exp_Basic):
             file.write(summary_line + "\n")
 
     def _select_optimizer(self):
+        trainable_params = self._trainable_parameters()
         return torch.optim.AdamW(
-            self.model.parameters(),
+            trainable_params,
             lr=self.args.learning_rate,
             weight_decay=self.args.weight_decay,
         )
@@ -244,14 +280,16 @@ class TokenLLM_Main(Exp_Basic):
 
     def _compute_ct_gpt2_losses(self, outputs):
         """
-        Robust CT-GPT2 objective.
+        CT-GPT2 objective with embedding alignment supervision.
 
         Total loss:
-            lambda_pred  * distribution_loss
-          + lambda_point * point_loss
-          + lambda_diff  * delta_loss
-          + lambda_con   * contrastive_loss
+            lambda_pred  * pred_loss
+          + lambda_con   * con_loss
           + lambda_trend * trend_loss
+
+        `point_loss` and `delta_loss` are still computed for monitoring, but the
+        training objective follows the alignment-aware weighting requested by
+        the task definition.
         """
         target = outputs["target"]
         forecast = outputs["forecast"]
@@ -281,8 +319,6 @@ class TokenLLM_Main(Exp_Basic):
 
         total_loss = (
             self.args.lambda_pred * pred_loss
-            + self.args.lambda_point * point_loss
-            + self.args.lambda_diff * delta_loss
             + self.args.lambda_con * con_loss
             + self.args.lambda_trend * trend_loss
         )
@@ -305,13 +341,13 @@ class TokenLLM_Main(Exp_Basic):
             scaler.scale(total_loss).backward()
             if self.args.max_grad_norm > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self._trainable_parameters(), self.args.max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             total_loss.backward()
             if self.args.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self._trainable_parameters(), self.args.max_grad_norm)
             optimizer.step()
 
         metrics = {
@@ -437,8 +473,8 @@ class TokenLLM_Main(Exp_Basic):
 
             current_lr = model_optim.param_groups[0]["lr"]
             print(
-                "Epoch {0}: Steps-{1} | Train Loss: {2:.5f} Dist: {3:.5f} "
-                "Point: {4:.5f} Delta: {5:.5f} Con: {6:.5f} Trend: {7:.5f} "
+                "Epoch {0}: Steps-{1} | Train Loss: {2:.5f} Pred: {3:.5f} "
+                "Point: {4:.5f} Delta: {5:.5f} Align: {6:.5f} Trend: {7:.5f} "
                 "Vali.Loss: {8:.5f} Vali.MAE: {9:.5f} Test.MSE: {10:.5f} "
                 "Test.MAE: {11:.5f} LR: {12:.6f} | {13:.2f}s".format(
                     epoch + 1,
@@ -483,8 +519,6 @@ class TokenLLM_Main(Exp_Basic):
             outputs = model.forward_batch(batch_x, batch_y, teacher_forcing=True)
             total_loss = (
                 lambda_pred * outputs["distribution_loss"]
-                + lambda_point * outputs["point_loss"]
-                + lambda_diff * outputs["delta_loss"]
                 + lambda_con * outputs["con_loss"]
                 + lambda_trend * outputs["trend_loss"]
             )

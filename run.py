@@ -59,6 +59,8 @@ def build_args():
     parser.add_argument("--use_pretrained_gpt2", type=str2bool, default=False)
     parser.add_argument("--prefer_local_gpt2", type=str2bool, default=True)
     parser.add_argument("--gpt_local_files_only", type=str2bool, default=True)
+    parser.add_argument("--freeze_gpt2", type=str2bool, default=True)
+    parser.add_argument("--gpt2_trainable_layers", type=int, default=1)
     parser.add_argument("--decoder_hidden_dim", type=int, default=512)
     parser.add_argument("--decoder_dropout", type=float, default=0.2)
     parser.add_argument("--num_output_mixtures", type=int, default=1)
@@ -107,6 +109,8 @@ def build_args():
     args.use_multi_gpu = bool(args.use_multi_gpu)
     args.use_amp = bool(args.use_amp) and args.use_gpu
     args.gpt_local_path = resolve_gpt_local_path(args.gpt_local_path)
+    args.freeze_gpt2 = bool(args.freeze_gpt2)
+    args.gpt2_trainable_layers = max(0, int(args.gpt2_trainable_layers))
     args.decoder_hidden_dim = None if args.decoder_hidden_dim <= 0 else args.decoder_hidden_dim
     args.alignment_hidden_dim = None if args.alignment_hidden_dim <= 0 else args.alignment_hidden_dim
     args.eval_num_sampling_paths = max(0, int(args.eval_num_sampling_paths))

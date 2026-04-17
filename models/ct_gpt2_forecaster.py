@@ -10,8 +10,12 @@ from models.output_decoder import OutputDecodingModule
 class ContinuousGPT2Forecaster(nn.Module):
     """
     CT-GPT2 forecaster:
-    normalized scalars -> ContinuousEmbedding -> Alignment(optional) -> GPT-2
+    normalized scalars -> ContinuousEmbedding -> AlignmentModule -> GPT-2
     -> OutputDecodingModule.
+
+    `ContinuousEmbedding` first produces `e_cont`. When alignment is enabled,
+    `AlignmentModule` applies a learnable projection to obtain `e_aligned`,
+    which is the tensor that GPT-2 receives as `inputs_embeds`.
     """
 
     def __init__(
@@ -40,6 +44,8 @@ class ContinuousGPT2Forecaster(nn.Module):
         alignment_augmentation_std=0.02,
         decoder_dropout=0.1,
         use_trend_regression=True,
+        freeze_gpt2=True,
+        gpt2_trainable_layers=1,
     ):
         super().__init__()
         self.num_sampling_paths = num_sampling_paths
@@ -59,13 +65,16 @@ class ContinuousGPT2Forecaster(nn.Module):
             n_heads=n_heads,
             dropout=dropout,
             disable_internal_position_embeddings=True,
+            freeze_gpt2=freeze_gpt2,
+            gpt2_trainable_layers=gpt2_trainable_layers,
         )
         self.hidden_size = self.backbone.hidden_size
         self.max_len = self.backbone.max_seq_len
         self.embedding = ContinuousEmbedding(self.hidden_size, self.max_len)
         self.alignment_module = AlignmentModule(
-            d_model=self.hidden_size,
-            hidden_dim=alignment_hidden_dim,
+            input_dim=self.hidden_size,
+            hidden_size=self.backbone.hidden_size,
+            projection_dim=alignment_hidden_dim,
             temperature=contrastive_temperature,
             dropout=alignment_dropout,
             augmentation_std=alignment_augmentation_std,
@@ -80,6 +89,9 @@ class ContinuousGPT2Forecaster(nn.Module):
             dropout=decoder_dropout,
             use_trend_regression=use_trend_regression,
         )
+
+    def get_gpt2_trainability_report(self):
+        return self.backbone.get_trainability_report()
 
     def _get_past_length(self, past_key_values):
         if past_key_values is None:
@@ -143,14 +155,14 @@ class ContinuousGPT2Forecaster(nn.Module):
         return self.output_decoder.point_forecast(params), params
 
     def forward_components(self, values, past_key_values=None, use_cache=False, compute_alignment_losses=False):
-        embeddings = self.embed_values(values, past_key_values=past_key_values)
-        aligned_embeddings, alignment_aux = self.align_embeddings(
-            embeddings,
+        e_cont = self.embed_values(values, past_key_values=past_key_values)
+        e_aligned, alignment_aux = self.align_embeddings(
+            e_cont,
             values=values,
             compute_losses=compute_alignment_losses,
         )
         backbone_outputs = self.backbone_forward(
-            embeddings=aligned_embeddings,
+            embeddings=e_aligned,
             attention_mask=self._build_attention_mask(values, past_key_values=past_key_values),
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -160,8 +172,8 @@ class ContinuousGPT2Forecaster(nn.Module):
             base_values=values,
         )
         return {
-            "embeddings": embeddings,
-            "aligned_embeddings": aligned_embeddings,
+            "embeddings": e_cont,
+            "aligned_embeddings": e_aligned,
             "hidden_states": backbone_outputs["last_hidden_state"],
             "past_key_values": backbone_outputs["past_key_values"],
             "point_forecast": point_forecast,
