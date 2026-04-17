@@ -42,6 +42,10 @@ class ContinuousGPT2Forecaster(nn.Module):
         contrastive_temperature=0.1,
         alignment_dropout=0.1,
         alignment_augmentation_std=0.02,
+        use_token_distribution_loss=True,
+        token_distribution_samples=256,
+        token_distribution_bandwidth=1.0,
+        token_moment_weight=0.1,
         decoder_dropout=0.1,
         use_trend_regression=True,
         freeze_gpt2=True,
@@ -52,6 +56,7 @@ class ContinuousGPT2Forecaster(nn.Module):
         self.use_alignment = use_alignment
         self.use_contrastive_loss = use_contrastive_loss
         self.use_trend_loss = use_trend_loss
+        self.use_token_distribution_loss = use_token_distribution_loss
 
         self.backbone = GPT2BackboneWrapper(
             model_name=model_name,
@@ -78,6 +83,9 @@ class ContinuousGPT2Forecaster(nn.Module):
             temperature=contrastive_temperature,
             dropout=alignment_dropout,
             augmentation_std=alignment_augmentation_std,
+            token_distribution_samples=token_distribution_samples,
+            token_distribution_bandwidth=token_distribution_bandwidth,
+            token_moment_weight=token_moment_weight,
         ) if use_alignment else None
         self.output_decoder = OutputDecodingModule(
             hidden_size=self.hidden_size,
@@ -92,6 +100,9 @@ class ContinuousGPT2Forecaster(nn.Module):
 
     def get_gpt2_trainability_report(self):
         return self.backbone.get_trainability_report()
+
+    def get_token_embedding_matrix(self):
+        return self.backbone.get_token_embedding_matrix()
 
     def _get_past_length(self, past_key_values):
         if past_key_values is None:
@@ -123,13 +134,15 @@ class ContinuousGPT2Forecaster(nn.Module):
     def align_embeddings(self, embeddings, values=None, compute_losses=True):
         if self.alignment_module is None:
             zero = embeddings.new_tensor(0.0)
-            return embeddings, {"con_loss": zero, "trend_loss": zero}
+            return embeddings, {"con_loss": zero, "trend_loss": zero, "token_dist_loss": zero}
         return self.alignment_module(
             embeddings,
             values=values,
+            token_embedding_matrix=self.get_token_embedding_matrix(),
             compute_losses=compute_losses,
             use_contrastive=self.use_contrastive_loss,
             use_trend=self.use_trend_loss,
+            use_token_distribution=self.use_token_distribution_loss and self.backbone.is_pretrained_backbone,
         )
 
     def _build_attention_mask(self, values, past_key_values=None):
@@ -180,6 +193,7 @@ class ContinuousGPT2Forecaster(nn.Module):
             "params": params,
             "con_loss": alignment_aux["con_loss"],
             "trend_loss": alignment_aux["trend_loss"],
+            "token_dist_loss": alignment_aux["token_dist_loss"],
         }
 
     def generate_sampling_paths(self, prefix_values, horizon, num_paths):
@@ -256,6 +270,7 @@ class ContinuousGPT2Forecaster(nn.Module):
                 "delta_loss": self.output_decoder.trend_regression_loss(future_values, prev_values, params),
                 "con_loss": outputs["con_loss"],
                 "trend_loss": outputs["trend_loss"],
+                "token_dist_loss": outputs["token_dist_loss"],
                 "sample_paths": None,
                 "mean_paths": None,
             }
@@ -339,6 +354,7 @@ class ContinuousGPT2Forecaster(nn.Module):
             "delta_loss": delta_loss,
             "con_loss": forecast.new_tensor(0.0),
             "trend_loss": forecast.new_tensor(0.0),
+            "token_dist_loss": forecast.new_tensor(0.0),
             "sample_paths": sample_paths,
             "mean_paths": mean_paths,
         }

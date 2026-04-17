@@ -54,8 +54,10 @@ class GPT2BackboneWrapper(nn.Module):
         self.max_seq_len = max_seq_len
         self.freeze_gpt2 = freeze_gpt2
         self.gpt2_trainable_layers = max(0, int(gpt2_trainable_layers))
+        self.is_pretrained_backbone = bool(use_pretrained)
 
         resolved_model_name, resolved_local_files_only = self._resolve_pretrained_source()
+        self.pretrained_source = resolved_model_name if use_pretrained else "random-init"
         if use_pretrained:
             self.gpt2 = GPT2Model.from_pretrained(
                 resolved_model_name,
@@ -164,7 +166,15 @@ class GPT2BackboneWrapper(nn.Module):
         }
 
     def get_trainability_report(self):
-        return dict(self._trainability_report)
+        report = dict(self._trainability_report)
+        report["use_pretrained"] = self.is_pretrained_backbone
+        report["pretrained_source"] = self.pretrained_source
+        return report
+
+    def get_token_embedding_matrix(self):
+        if not hasattr(self.gpt2, "wte") or self.gpt2.wte is None:
+            return None
+        return self.gpt2.wte.weight.detach()
 
     def train(self, mode=True):
         super().train(mode)

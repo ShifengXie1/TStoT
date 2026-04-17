@@ -21,7 +21,9 @@ plt.switch_backend("agg")
 def build_setting(args):
     return (
         f"{args.model}_{args.data}_sl{args.seq_len}_pl{args.pred_len}_"
-        f"dm{args.d_model}_nl{args.n_layers}_nh{args.n_heads}_ctgpt2"
+        f"dm{args.d_model}_nl{args.n_layers}_nh{args.n_heads}_"
+        f"pt{int(bool(args.use_pretrained_gpt2))}_frz{int(bool(args.freeze_gpt2))}_"
+        f"tl{int(args.gpt2_trainable_layers)}_ctgpt2"
     )
 
 
@@ -108,8 +110,10 @@ class TokenLLM_Main(Exp_Basic):
 
         report = model.get_gpt2_trainability_report()
         print(
-            "GPT-2 trainability | mode={0} | total_layers={1} | trainable_layers={2} | frozen_layers={3}".format(
+            "GPT-2 trainability | mode={0} | source={1} | pretrained={2} | total_layers={3} | trainable_layers={4} | frozen_layers={5}".format(
                 report.get("mode", "unknown"),
+                report.get("pretrained_source", "unknown"),
+                report.get("use_pretrained", False),
                 report.get("total_layers", 0),
                 self._format_layer_list(report.get("trainable_layers", [])),
                 self._format_layer_list(report.get("frozen_layers", [])),
@@ -271,6 +275,7 @@ class TokenLLM_Main(Exp_Basic):
             "delta_loss": aux.get("delta_loss"),
             "con_loss": aux.get("con_loss", forecast.new_tensor(0.0)),
             "trend_loss": aux.get("trend_loss", forecast.new_tensor(0.0)),
+            "token_dist_loss": aux.get("token_dist_loss", forecast.new_tensor(0.0)),
             "hidden_states": aux.get("hidden_states"),
             "embeddings": aux.get("embeddings"),
             "aligned_embeddings": aux.get("aligned_embeddings"),
@@ -284,12 +289,17 @@ class TokenLLM_Main(Exp_Basic):
 
         Total loss:
             lambda_pred  * pred_loss
+          + lambda_point * point_loss
+          + lambda_diff  * delta_loss
           + lambda_con   * con_loss
           + lambda_trend * trend_loss
+          + lambda_token * token_dist_loss
 
-        `point_loss` and `delta_loss` are still computed for monitoring, but the
-        training objective follows the alignment-aware weighting requested by
-        the task definition.
+        The deterministic point-wise losses are part of the optimization
+        objective so validation/test MAE/MSE stay aligned with what the model
+        is trained to minimize. When pretrained GPT-2 is enabled, we also
+        explicitly match the aligned time-series embeddings to the pretrained
+        token embedding distribution.
         """
         target = outputs["target"]
         forecast = outputs["forecast"]
@@ -317,10 +327,17 @@ class TokenLLM_Main(Exp_Basic):
         if trend_loss is None or not (self.args.use_alignment and self.args.use_trend_loss):
             trend_loss = pred_loss.new_tensor(0.0)
 
+        token_dist_loss = outputs.get("token_dist_loss")
+        if token_dist_loss is None or not (self.args.use_alignment and self.args.use_token_distribution_loss):
+            token_dist_loss = pred_loss.new_tensor(0.0)
+
         total_loss = (
             self.args.lambda_pred * pred_loss
+            + self.args.lambda_point * point_loss
+            + self.args.lambda_diff * delta_loss
             + self.args.lambda_con * con_loss
             + self.args.lambda_trend * trend_loss
+            + self.args.lambda_token * token_dist_loss
         )
         return {
             "loss": total_loss,
@@ -329,6 +346,7 @@ class TokenLLM_Main(Exp_Basic):
             "delta_loss": delta_loss,
             "con_loss": con_loss,
             "trend_loss": trend_loss,
+            "token_dist_loss": token_dist_loss,
         }
 
     def _train_step(self, batch_x, batch_y, optimizer, scaler=None):
@@ -357,6 +375,7 @@ class TokenLLM_Main(Exp_Basic):
             "delta_loss": float(loss_dict["delta_loss"].detach().item()),
             "con_loss": float(loss_dict["con_loss"].detach().item()),
             "trend_loss": float(loss_dict["trend_loss"].detach().item()),
+            "token_dist_loss": float(loss_dict["token_dist_loss"].detach().item()),
         }
         return outputs, metrics
 
@@ -369,6 +388,7 @@ class TokenLLM_Main(Exp_Basic):
             "delta_loss": [],
             "con_loss": [],
             "trend_loss": [],
+            "token_dist_loss": [],
         }
 
         for batch_x, batch_y in train_loader:
@@ -382,6 +402,7 @@ class TokenLLM_Main(Exp_Basic):
         losses = []
         preds_scaled, trues_scaled = [], []
         eval_num_paths = self._get_eval_num_paths() if not train_mode else 0
+        eval_use_sampling = bool(getattr(self.args, "eval_use_sampling", False)) and eval_num_paths > 0
 
         self.model.train() if train_mode else self.model.eval()
 
@@ -397,7 +418,7 @@ class TokenLLM_Main(Exp_Basic):
                 target = outputs["target"]
                 losses.append(loss_dict["loss"].item())
 
-                if train_mode or eval_num_paths <= 0:
+                if train_mode or not eval_use_sampling:
                     preds_batch = outputs["forecast"]
                 else:
                     model = self._base_model()
@@ -414,7 +435,10 @@ class TokenLLM_Main(Exp_Basic):
                             horizon=self.args.pred_len,
                             num_paths=eval_num_paths,
                         )
-                    # Use only the sample mean across trajectories for evaluation.
+                    # Optional uncertainty-aware evaluation path. For point
+                    # metrics like MSE/MAE we prefer deterministic forecasts by
+                    # default, because finite-path sample means add variance and
+                    # can look systematically biased on small path counts.
                     preds_batch = sampled_paths.mean(dim=1)
 
                 preds_scaled.append(preds_batch.detach().cpu())
@@ -458,6 +482,16 @@ class TokenLLM_Main(Exp_Basic):
             train_loss = train_metrics["loss"]
             vali_loss, vali_mae, _, _, _, _, _, _ = self.vali(vali_data, vali_loader)
             test_loss, test_mae, test_mse, _, _, _, _, _ = self.vali(test_data, test_loader)
+            early_stop_metric = getattr(self.args, "early_stop_metric", "mae")
+            if early_stop_metric == "loss":
+                early_stop_value = vali_loss
+            elif early_stop_metric == "mae":
+                early_stop_value = vali_mae
+            else:
+                raise ValueError(
+                    f"Unsupported early_stop_metric: {self.args.early_stop_metric}. "
+                    "Expected 'loss' or 'mae'."
+                )
 
             if test_loss < self.min_test_loss:
                 self.min_test_loss = test_loss
@@ -474,9 +508,9 @@ class TokenLLM_Main(Exp_Basic):
             current_lr = model_optim.param_groups[0]["lr"]
             print(
                 "Epoch {0}: Steps-{1} | Train Loss: {2:.5f} Pred: {3:.5f} "
-                "Point: {4:.5f} Delta: {5:.5f} Align: {6:.5f} Trend: {7:.5f} "
-                "Vali.Loss: {8:.5f} Vali.MAE: {9:.5f} Test.MSE: {10:.5f} "
-                "Test.MAE: {11:.5f} LR: {12:.6f} | {13:.2f}s".format(
+                "Point: {4:.5f} Delta: {5:.5f} Align: {6:.5f} Trend: {7:.5f} Token: {8:.5f} "
+                "Vali.Loss: {9:.5f} Vali.MAE: {10:.5f} EarlyStop({11}): {12:.5f} "
+                "Test.MSE: {13:.5f} Test.MAE: {14:.5f} LR: {15:.6f} | {16:.2f}s".format(
                     epoch + 1,
                     train_steps,
                     train_loss,
@@ -485,8 +519,11 @@ class TokenLLM_Main(Exp_Basic):
                     train_metrics["delta_loss"],
                     train_metrics["con_loss"],
                     train_metrics["trend_loss"],
+                    train_metrics["token_dist_loss"],
                     vali_loss,
                     vali_mae,
+                    early_stop_metric,
+                    early_stop_value,
                     test_mse,
                     test_mae,
                     current_lr,
@@ -494,7 +531,7 @@ class TokenLLM_Main(Exp_Basic):
                 )
             )
 
-            early_stopping(vali_loss, self.model, checkpoint_dir)
+            early_stopping(early_stop_value, self.model, checkpoint_dir)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
@@ -529,10 +566,11 @@ class TokenLLM_Main(Exp_Basic):
         target_idx = get_target_index(self.args) if self.args.use_multivariate else None
         y_true = np.asarray(select_channel(trues[0], target_idx))
         y_pred = np.asarray(select_channel(preds[0], target_idx))
+        pred_label = "Sample Mean" if bool(getattr(self.args, "eval_use_sampling", False)) else "Point Forecast"
 
         plt.figure(figsize=(10, 4))
         plt.plot(y_true, label="GroundTruth", linewidth=2, color="#1f77b4")
-        plt.plot(y_pred, label="Sample Mean", linewidth=2, color="#ff7f0e")
+        plt.plot(y_pred, label=pred_label, linewidth=2, color="#ff7f0e")
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(results_dir, "forecast.png"), bbox_inches="tight")
@@ -567,7 +605,9 @@ class TokenLLM_Main(Exp_Basic):
         run_dt = self.run_dt or datetime.now()
         np.save(os.path.join(results_dir, "metrics.npy"), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(results_dir, "pred.npy"), preds)
-        np.save(os.path.join(results_dir, "sample_mean.npy"), preds)
+        np.save(os.path.join(results_dir, "point_forecast.npy"), preds)
+        if bool(getattr(self.args, "eval_use_sampling", False)):
+            np.save(os.path.join(results_dir, "sample_mean.npy"), preds)
         np.save(os.path.join(results_dir, "true.npy"), trues)
         self._save_visualization(results_dir, preds, trues)
 

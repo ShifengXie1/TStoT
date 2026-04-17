@@ -20,6 +20,8 @@ class AlignmentModule(nn.Module):
        embeddings.
     2. A trend continuity loss that matches first/second-order embedding
        differences to the underlying value differences.
+    3. An explicit distribution-matching loss that pulls aligned time-series
+       embeddings toward the pretrained GPT token embedding distribution.
     """
 
     def __init__(
@@ -31,12 +33,18 @@ class AlignmentModule(nn.Module):
         dropout=0.1,
         augmentation_std=0.02,
         second_order_weight=0.5,
+        token_distribution_samples=256,
+        token_distribution_bandwidth=1.0,
+        token_moment_weight=0.1,
     ):
         super().__init__()
         projection_dim = projection_dim or hidden_size
         self.temperature = temperature
         self.augmentation_std = augmentation_std
         self.second_order_weight = second_order_weight
+        self.token_distribution_samples = max(8, int(token_distribution_samples))
+        self.token_distribution_bandwidth = float(token_distribution_bandwidth)
+        self.token_moment_weight = float(token_moment_weight)
 
         self.align = nn.Linear(input_dim, hidden_size, bias=True)
         self.view_dropout = nn.Dropout(dropout)
@@ -111,20 +119,76 @@ class AlignmentModule(nn.Module):
 
         return first_order_loss + self.second_order_weight * second_order_loss
 
+    @staticmethod
+    def _sample_rows(matrix, num_samples):
+        if matrix.size(0) <= num_samples:
+            return matrix
+        indices = torch.randperm(matrix.size(0), device=matrix.device)[:num_samples]
+        return matrix.index_select(0, indices)
+
+    def _rbf_kernel(self, x, y):
+        dist2 = torch.cdist(x, y, p=2).pow(2)
+        scale = max(1e-6, 2.0 * self.token_distribution_bandwidth * self.token_distribution_bandwidth * x.size(-1))
+        return torch.exp(-dist2 / scale)
+
+    def _token_distribution_loss(self, aligned_embeddings, token_embedding_matrix):
+        if token_embedding_matrix is None:
+            return aligned_embeddings.new_tensor(0.0)
+
+        aligned_flat = aligned_embeddings.reshape(-1, aligned_embeddings.size(-1))
+        if aligned_flat.size(0) <= 1:
+            return aligned_embeddings.new_tensor(0.0)
+
+        aligned_flat = self._sample_rows(aligned_flat, self.token_distribution_samples)
+        token_embeddings = token_embedding_matrix.to(
+            device=aligned_embeddings.device,
+            dtype=aligned_embeddings.dtype,
+        )
+        token_embeddings = self._sample_rows(
+            token_embeddings,
+            max(self.token_distribution_samples, aligned_flat.size(0)),
+        )
+
+        aligned_flat = F.normalize(aligned_flat, dim=-1)
+        token_embeddings = F.normalize(token_embeddings, dim=-1)
+
+        k_xx = self._rbf_kernel(aligned_flat, aligned_flat).mean()
+        k_yy = self._rbf_kernel(token_embeddings, token_embeddings).mean()
+        k_xy = self._rbf_kernel(aligned_flat, token_embeddings).mean()
+        mmd_loss = k_xx + k_yy - 2.0 * k_xy
+
+        moment_loss = F.mse_loss(aligned_flat.mean(dim=0), token_embeddings.mean(dim=0))
+        moment_loss = moment_loss + F.mse_loss(
+            aligned_flat.std(dim=0, unbiased=False),
+            token_embeddings.std(dim=0, unbiased=False),
+        )
+        return mmd_loss + self.token_moment_weight * moment_loss
+
     def forward(
         self,
         embeddings,
         values=None,
+        token_embedding_matrix=None,
         compute_losses=True,
         use_contrastive=True,
         use_trend=True,
+        use_token_distribution=True,
     ):
         aligned_embeddings = self.align(embeddings)
         zero = aligned_embeddings.new_tensor(0.0)
 
         if not compute_losses:
-            return aligned_embeddings, {"con_loss": zero, "trend_loss": zero}
+            return aligned_embeddings, {"con_loss": zero, "trend_loss": zero, "token_dist_loss": zero}
 
         con_loss = self._contrastive_loss(aligned_embeddings) if use_contrastive else zero
         trend_loss = self._trend_loss(aligned_embeddings, values) if use_trend else zero
-        return aligned_embeddings, {"con_loss": con_loss, "trend_loss": trend_loss}
+        token_dist_loss = (
+            self._token_distribution_loss(aligned_embeddings, token_embedding_matrix)
+            if use_token_distribution
+            else zero
+        )
+        return aligned_embeddings, {
+            "con_loss": con_loss,
+            "trend_loss": trend_loss,
+            "token_dist_loss": token_dist_loss,
+        }

@@ -8,16 +8,18 @@ export SEQ_LEN=96
 export PATCH_SIZE=8
 export STRIDE=2
 export VOCAB_SIZE=128
-export D_MODEL=512
-export N_LAYERS=6
-export N_HEADS=8
+export D_MODEL=768
+export N_LAYERS=12
+export N_HEADS=12
 export DROPOUT=0.2
 export USE_LINEAR_SHORTCUT=true
 export GPT_MODEL_NAME="openai-community/gpt2"
 export GPT_LOCAL_PATH="./gpt"
-export USE_PRETRAINED_GPT2=false
+export USE_PRETRAINED_GPT2=true
 export PREFER_LOCAL_GPT2=true
 export GPT_LOCAL_FILES_ONLY=true
+export FREEZE_GPT2=false
+export GPT2_TRAINABLE_LAYERS=2
 
 # CT-GPT2 specific options
 # Updated from the old token_llm_forecasting script:
@@ -26,11 +28,12 @@ export GPT_LOCAL_FILES_ONLY=true
 # - added continuous-decoding / probabilistic forecasting options below
 export USE_CHRONOS_SCALING=false
 export SCALING_EPS=1e-8
-export DECODER_HIDDEN_DIM=512
+export DECODER_HIDDEN_DIM=768
 export DECODER_DROPOUT=0.2
 export NUM_OUTPUT_MIXTURES=1
 export NUM_SAMPLING_PATHS=0
 export EVAL_NUM_SAMPLING_PATHS=20
+export EVAL_USE_SAMPLING=false
 export MIN_LOG_VARIANCE=-6.0
 export MAX_LOG_VARIANCE=2.0
 export USE_ALIGNMENT=true
@@ -41,12 +44,18 @@ export ALIGNMENT_HIDDEN_DIM=512
 export ALIGNMENT_DROPOUT=0.2
 export ALIGNMENT_AUGMENTATION_STD=0.02
 export CONTRASTIVE_TEMPERATURE=0.1
+export USE_TOKEN_DISTRIBUTION_LOSS=true
+export LAMBDA_TOKEN=0.2
+export TOKEN_DISTRIBUTION_SAMPLES=256
+export TOKEN_DISTRIBUTION_BANDWIDTH=1.0
+export TOKEN_MOMENT_WEIGHT=0.1
 
 export BATCH_SIZE=32
 export LEARNING_RATE=0.0001
 export WEIGHT_DECAY=0.0005
 export TRAIN_EPOCHS=50
 export PATIENCE=3
+export EARLY_STOP_METRIC="loss"
 export LRADJ="type3"
 export SCHEDULER_TYPE="warmup_cosine"
 export WARMUP_EPOCHS=3
@@ -87,11 +96,14 @@ for PRED_LEN in 96 ; do
     --use_pretrained_gpt2 $USE_PRETRAINED_GPT2 \
     --prefer_local_gpt2 $PREFER_LOCAL_GPT2 \
     --gpt_local_files_only $GPT_LOCAL_FILES_ONLY \
+    --freeze_gpt2 $FREEZE_GPT2 \
+    --gpt2_trainable_layers $GPT2_TRAINABLE_LAYERS \
     --decoder_hidden_dim $DECODER_HIDDEN_DIM \
     --decoder_dropout $DECODER_DROPOUT \
     --num_output_mixtures $NUM_OUTPUT_MIXTURES \
     --num_sampling_paths $NUM_SAMPLING_PATHS \
     --eval_num_sampling_paths $EVAL_NUM_SAMPLING_PATHS \
+    --eval_use_sampling $EVAL_USE_SAMPLING \
     --min_log_variance $MIN_LOG_VARIANCE \
     --max_log_variance $MAX_LOG_VARIANCE \
     --use_alignment $USE_ALIGNMENT \
@@ -102,11 +114,17 @@ for PRED_LEN in 96 ; do
     --alignment_dropout $ALIGNMENT_DROPOUT \
     --alignment_augmentation_std $ALIGNMENT_AUGMENTATION_STD \
     --contrastive_temperature $CONTRASTIVE_TEMPERATURE \
+    --use_token_distribution_loss $USE_TOKEN_DISTRIBUTION_LOSS \
+    --lambda_token $LAMBDA_TOKEN \
+    --token_distribution_samples $TOKEN_DISTRIBUTION_SAMPLES \
+    --token_distribution_bandwidth $TOKEN_DISTRIBUTION_BANDWIDTH \
+    --token_moment_weight $TOKEN_MOMENT_WEIGHT \
     --batch_size $BATCH_SIZE \
     --learning_rate $LEARNING_RATE \
     --weight_decay $WEIGHT_DECAY \
     --train_epochs $TRAIN_EPOCHS \
     --patience $PATIENCE \
+    --early_stop_metric $EARLY_STOP_METRIC \
     --lradj $LRADJ \
     --scheduler_type $SCHEDULER_TYPE \
     --warmup_epochs $WARMUP_EPOCHS \
