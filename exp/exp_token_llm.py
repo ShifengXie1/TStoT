@@ -21,6 +21,7 @@ plt.switch_backend("agg")
 def build_setting(args):
     return (
         f"{args.model}_{args.data}_sl{args.seq_len}_pl{args.pred_len}_"
+        f"ps{args.patch_size}_ptstr{args.patch_stride}_"
         f"dm{args.d_model}_nl{args.n_layers}_nh{args.n_heads}_"
         f"pt{int(bool(args.use_pretrained_gpt2))}_frz{int(bool(args.freeze_gpt2))}_"
         f"tl{int(args.gpt2_trainable_layers)}_ctgpt2"
@@ -60,6 +61,7 @@ class TokenLLM_Main(Exp_Basic):
         self.epoch_for_min_test_loss = 0
         self.run_dt = None
         self.run_dir = None
+        self._current_teacher_forcing = True
 
     def _ensure_runtime_args(self, args):
         if not hasattr(args, "use_gpu"):
@@ -351,7 +353,11 @@ class TokenLLM_Main(Exp_Basic):
 
     def _train_step(self, batch_x, batch_y, optimizer, scaler=None):
         optimizer.zero_grad(set_to_none=True)
-        outputs = self._forward_ct_gpt2_batch(batch_x, batch_y, teacher_forcing=True)
+        outputs = self._forward_ct_gpt2_batch(
+            batch_x,
+            batch_y,
+            teacher_forcing=self._current_teacher_forcing,
+        )
         loss_dict = self._compute_ct_gpt2_losses(outputs)
         total_loss = loss_dict["loss"]
 
@@ -379,7 +385,17 @@ class TokenLLM_Main(Exp_Basic):
         }
         return outputs, metrics
 
-    def _train_epoch(self, train_loader, optimizer, scaler=None):
+    def _get_teacher_forcing_ratio(self, epoch):
+        start = float(getattr(self.args, "teacher_forcing_ratio_start", 1.0))
+        end = float(getattr(self.args, "teacher_forcing_ratio_end", 0.3))
+        anneal_epochs = max(1, int(getattr(self.args, "teacher_forcing_anneal_epochs", 10)))
+        if anneal_epochs <= 1:
+            return end
+
+        progress = min(max(epoch, 0), anneal_epochs - 1) / float(anneal_epochs - 1)
+        return start + (end - start) * progress
+
+    def _train_epoch(self, train_loader, optimizer, scaler=None, epoch=0):
         self.model.train()
         running = {
             "loss": [],
@@ -390,13 +406,17 @@ class TokenLLM_Main(Exp_Basic):
             "trend_loss": [],
             "token_dist_loss": [],
         }
+        teacher_forcing_ratio = self._get_teacher_forcing_ratio(epoch)
 
         for batch_x, batch_y in train_loader:
+            self._current_teacher_forcing = bool(np.random.rand() < teacher_forcing_ratio)
             _, step_metrics = self._train_step(batch_x, batch_y, optimizer, scaler=scaler)
             for key in running:
                 running[key].append(step_metrics[key])
 
-        return {key: float(np.mean(values)) if values else 0.0 for key, values in running.items()}
+        epoch_metrics = {key: float(np.mean(values)) if values else 0.0 for key, values in running.items()}
+        epoch_metrics["teacher_forcing_ratio"] = teacher_forcing_ratio
+        return epoch_metrics
 
     def _run_loader(self, data_set, data_loader, train_mode):
         losses = []
@@ -478,7 +498,7 @@ class TokenLLM_Main(Exp_Basic):
 
         for epoch in range(self.args.train_epochs):
             epoch_time = time.time()
-            train_metrics = self._train_epoch(train_loader, model_optim, scaler=scaler)
+            train_metrics = self._train_epoch(train_loader, model_optim, scaler=scaler, epoch=epoch)
             train_loss = train_metrics["loss"]
             vali_loss, vali_mae, _, _, _, _, _, _ = self.vali(vali_data, vali_loader)
             test_loss, test_mae, test_mse, _, _, _, _, _ = self.vali(test_data, test_loader)
@@ -509,8 +529,8 @@ class TokenLLM_Main(Exp_Basic):
             print(
                 "Epoch {0}: Steps-{1} | Train Loss: {2:.5f} Pred: {3:.5f} "
                 "Point: {4:.5f} Delta: {5:.5f} Align: {6:.5f} Trend: {7:.5f} Token: {8:.5f} "
-                "Vali.Loss: {9:.5f} Vali.MAE: {10:.5f} EarlyStop({11}): {12:.5f} "
-                "Test.MSE: {13:.5f} Test.MAE: {14:.5f} LR: {15:.6f} | {16:.2f}s".format(
+                "TF: {9:.2f} Vali.Loss: {10:.5f} Vali.MAE: {11:.5f} EarlyStop({12}): {13:.5f} "
+                "Test.MSE: {14:.5f} Test.MAE: {15:.5f} LR: {16:.6f} | {17:.2f}s".format(
                     epoch + 1,
                     train_steps,
                     train_loss,
@@ -520,6 +540,7 @@ class TokenLLM_Main(Exp_Basic):
                     train_metrics["con_loss"],
                     train_metrics["trend_loss"],
                     train_metrics["token_dist_loss"],
+                    train_metrics["teacher_forcing_ratio"],
                     vali_loss,
                     vali_mae,
                     early_stop_metric,

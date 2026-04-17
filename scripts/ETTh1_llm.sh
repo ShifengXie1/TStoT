@@ -26,7 +26,7 @@ export GPT2_TRAINABLE_LAYERS=2
 # - model -> ct_gpt2
 # - tokenization-specific runtime flags removed from python call
 # - added continuous-decoding / probabilistic forecasting options below
-export USE_CHRONOS_SCALING=false
+export USE_CHRONOS_SCALING=true
 export SCALING_EPS=1e-8
 export DECODER_HIDDEN_DIM=768
 export DECODER_DROPOUT=0.2
@@ -45,16 +45,16 @@ export ALIGNMENT_DROPOUT=0.2
 export ALIGNMENT_AUGMENTATION_STD=0.02
 export CONTRASTIVE_TEMPERATURE=0.1
 export USE_TOKEN_DISTRIBUTION_LOSS=true
-export LAMBDA_TOKEN=0.2
+export LAMBDA_TOKEN=0.05
 export TOKEN_DISTRIBUTION_SAMPLES=256
 export TOKEN_DISTRIBUTION_BANDWIDTH=1.0
 export TOKEN_MOMENT_WEIGHT=0.1
 
 export BATCH_SIZE=32
-export LEARNING_RATE=0.0001
+export LEARNING_RATE=0.00005
 export WEIGHT_DECAY=0.0005
 export TRAIN_EPOCHS=50
-export PATIENCE=3
+export PATIENCE=5
 export EARLY_STOP_METRIC="loss"
 export LRADJ="type3"
 export SCHEDULER_TYPE="warmup_cosine"
@@ -64,9 +64,12 @@ export MIN_LR_RATIO=0.1
 export LAMBDA_PRED=1.0
 export LAMBDA_POINT=0.5
 export LAMBDA_DIFF=0.2
-export LAMBDA_CON=0.1
-export LAMBDA_TREND=0.2
+export LAMBDA_CON=0.05
+export LAMBDA_TREND=0.1
 export MAX_GRAD_NORM=1.0
+export TF_RATIO_START=1.0
+export TF_RATIO_END=0.2
+export TF_ANNEAL_EPOCHS=15
 
 export USE_MULTIVARIATE=false
 export TARGET_COL="OT"
@@ -84,6 +87,8 @@ for PRED_LEN in 96 ; do
     --data_path $DATA_PATH \
     --seq_len $SEQ_LEN \
     --pred_len $PRED_LEN \
+    --patch_size $PATCH_SIZE \
+    --patch_stride $STRIDE \
     --d_model $D_MODEL \
     --n_layers $N_LAYERS \
     --n_heads $N_HEADS \
@@ -135,6 +140,9 @@ for PRED_LEN in 96 ; do
     --lambda_con $LAMBDA_CON \
     --lambda_trend $LAMBDA_TREND \
     --max_grad_norm $MAX_GRAD_NORM \
+    --teacher_forcing_ratio_start $TF_RATIO_START \
+    --teacher_forcing_ratio_end $TF_RATIO_END \
+    --teacher_forcing_anneal_epochs $TF_ANNEAL_EPOCHS \
     --use_multivariate $USE_MULTIVARIATE \
     --target_col $TARGET_COL \
     --use_gpu $USE_GPU \

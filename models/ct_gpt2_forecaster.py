@@ -1,21 +1,23 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from models.alignment_module import AlignmentModule
-from models.continuous_embedding import ContinuousEmbedding
+from models.compensation_alignment import CompensationAlignmentModule
 from models.gpt2_backbone import GPT2BackboneWrapper
-from models.output_decoder import OutputDecodingModule
+from models.patch_embedding import TrendAwarePatchDecoder, TrendAwarePatchEmbedding
 
 
 class ContinuousGPT2Forecaster(nn.Module):
     """
-    CT-GPT2 forecaster:
-    normalized scalars -> ContinuousEmbedding -> AlignmentModule -> GPT-2
-    -> OutputDecodingModule.
+    Patch-based CT-GPT2 forecaster with compensation alignment.
 
-    `ContinuousEmbedding` first produces `e_cont`. When alignment is enabled,
-    `AlignmentModule` applies a learnable projection to obtain `e_aligned`,
-    which is the tensor that GPT-2 receives as `inputs_embeds`.
+    Time-series patches are encoded into a trend-aware latent space `z`, then
+    aligned to the pretrained token manifold through an affine compensation:
+
+        u = s(z) * z + b(z)
+
+    GPT-2 operates on `u`. The predicted GPT states are decompensated back to
+    `z` before patch decoding and overlap-add reconstruction.
     """
 
     def __init__(
@@ -50,13 +52,18 @@ class ContinuousGPT2Forecaster(nn.Module):
         use_trend_regression=True,
         freeze_gpt2=True,
         gpt2_trainable_layers=1,
+        patch_size=8,
+        patch_stride=8,
     ):
         super().__init__()
+        del num_output_mixtures, min_log_variance, max_log_variance, alignment_augmentation_std, token_distribution_bandwidth
         self.num_sampling_paths = num_sampling_paths
         self.use_alignment = use_alignment
         self.use_contrastive_loss = use_contrastive_loss
         self.use_trend_loss = use_trend_loss
         self.use_token_distribution_loss = use_token_distribution_loss
+        self.patch_size = int(patch_size)
+        self.patch_stride = int(patch_stride)
 
         self.backbone = GPT2BackboneWrapper(
             model_name=model_name,
@@ -75,166 +82,133 @@ class ContinuousGPT2Forecaster(nn.Module):
         )
         self.hidden_size = self.backbone.hidden_size
         self.max_len = self.backbone.max_seq_len
-        self.embedding = ContinuousEmbedding(self.hidden_size, self.max_len)
-        self.alignment_module = AlignmentModule(
-            input_dim=self.hidden_size,
+        self.embedding = TrendAwarePatchEmbedding(
+            patch_size=self.patch_size,
+            stride=self.patch_stride,
+            d_model=self.hidden_size,
+            max_patches=self.max_len,
+            dropout=dropout,
+        )
+        self.alignment_module = CompensationAlignmentModule(
             hidden_size=self.backbone.hidden_size,
             projection_dim=alignment_hidden_dim,
             temperature=contrastive_temperature,
             dropout=alignment_dropout,
-            augmentation_std=alignment_augmentation_std,
             token_distribution_samples=token_distribution_samples,
-            token_distribution_bandwidth=token_distribution_bandwidth,
             token_moment_weight=token_moment_weight,
         ) if use_alignment else None
-        self.output_decoder = OutputDecodingModule(
-            hidden_size=self.hidden_size,
-            output_dim=1,
-            decoder_hidden_dim=decoder_hidden_dim,
-            num_mixtures=num_output_mixtures,
-            min_log_variance=min_log_variance,
-            max_log_variance=max_log_variance,
-            dropout=decoder_dropout,
-            use_trend_regression=use_trend_regression,
+        self.latent_head = nn.Sequential(
+            nn.LayerNorm(self.hidden_size),
+            nn.Linear(self.hidden_size, decoder_hidden_dim or self.hidden_size),
+            nn.GELU(),
+            nn.Dropout(decoder_dropout),
+            nn.Linear(decoder_hidden_dim or self.hidden_size, self.hidden_size),
         )
+        self.patch_decoder = TrendAwarePatchDecoder(
+            d_model=self.hidden_size,
+            patch_size=self.patch_size,
+            hidden_dim=decoder_hidden_dim or self.hidden_size,
+            dropout=decoder_dropout,
+        )
+        self.log_variance = nn.Parameter(torch.tensor(0.0))
 
     def get_gpt2_trainability_report(self):
         return self.backbone.get_trainability_report()
 
+    @staticmethod
+    def num_patches_for_length(length, patch_size, stride):
+        return TrendAwarePatchEmbedding.num_patches_for_length(length, patch_size, stride)
+
     def get_token_embedding_matrix(self):
         return self.backbone.get_token_embedding_matrix()
 
-    def _get_past_length(self, past_key_values):
-        if past_key_values is None:
-            return 0
-        if hasattr(past_key_values, "get_seq_length"):
-            try:
-                return int(past_key_values.get_seq_length())
-            except TypeError:
-                return int(past_key_values.get_seq_length(0))
+    def _zero_alignment_losses(self, reference):
+        zero = reference.new_tensor(0.0)
+        return {"con_loss": zero, "token_dist_loss": zero, "comp_reg_loss": zero}
 
-        if hasattr(past_key_values, "key_cache") and len(past_key_values.key_cache) > 0:
-            first_key = past_key_values.key_cache[0]
-            if first_key is not None:
-                return first_key.size(-2)
-
-        if isinstance(past_key_values, (list, tuple)) and len(past_key_values) > 0:
-            return past_key_values[0][0].size(-2)
-
-        raise TypeError(
-            "Unsupported past_key_values type for CT-GPT2 cache handling: "
-            f"{type(past_key_values).__name__}"
-        )
-
-    def embed_values(self, values, past_key_values=None):
-        if values.dim() == 2:
-            values = values.unsqueeze(-1)
-        return self.embedding(values, position_offset=self._get_past_length(past_key_values))
-
-    def align_embeddings(self, embeddings, values=None, compute_losses=True):
+    def align_embeddings(self, embeddings, compute_losses=True):
         if self.alignment_module is None:
-            zero = embeddings.new_tensor(0.0)
-            return embeddings, {"con_loss": zero, "trend_loss": zero, "token_dist_loss": zero}
+            return embeddings, self._zero_alignment_losses(embeddings)
         return self.alignment_module(
             embeddings,
-            values=values,
             token_embedding_matrix=self.get_token_embedding_matrix(),
             compute_losses=compute_losses,
             use_contrastive=self.use_contrastive_loss,
-            use_trend=self.use_trend_loss,
             use_token_distribution=self.use_token_distribution_loss and self.backbone.is_pretrained_backbone,
         )
 
-    def _build_attention_mask(self, values, past_key_values=None):
-        if values.dim() == 2:
-            values = values.unsqueeze(-1)
+    def decompensate_embeddings(self, aligned_embeddings):
+        if self.alignment_module is None:
+            zero = aligned_embeddings.new_tensor(0.0)
+            return aligned_embeddings, {"inv_scale": zero, "inv_bias": zero}
+        return self.alignment_module.decompensate(aligned_embeddings)
+
+    @staticmethod
+    def _build_attention_mask(embeddings):
         return torch.ones(
-            values.size(0),
-            values.size(1) + self._get_past_length(past_key_values),
+            embeddings.size(0),
+            embeddings.size(1),
             dtype=torch.long,
-            device=values.device,
+            device=embeddings.device,
         )
 
-    def backbone_forward(self, embeddings, attention_mask, past_key_values=None, use_cache=False):
+    def backbone_forward(self, aligned_embeddings):
         return self.backbone(
-            continuous_embeddings=embeddings,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
+            continuous_embeddings=aligned_embeddings,
+            attention_mask=self._build_attention_mask(aligned_embeddings),
+            past_key_values=None,
+            use_cache=False,
         )
 
-    def decode_hidden_states(self, hidden_states, base_values=None):
-        params = self.output_decoder(hidden_states, base_values=base_values)
-        return self.output_decoder.point_forecast(params), params
+    def _compute_prediction_losses(self, forecast, target):
+        mse_loss = F.mse_loss(forecast, target)
+        point_loss = F.smooth_l1_loss(forecast, target)
 
-    def forward_components(self, values, past_key_values=None, use_cache=False, compute_alignment_losses=False):
-        e_cont = self.embed_values(values, past_key_values=past_key_values)
-        e_aligned, alignment_aux = self.align_embeddings(
-            e_cont,
-            values=values,
-            compute_losses=compute_alignment_losses,
-        )
-        backbone_outputs = self.backbone_forward(
-            embeddings=e_aligned,
-            attention_mask=self._build_attention_mask(values, past_key_values=past_key_values),
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-        )
-        point_forecast, params = self.decode_hidden_states(
-            backbone_outputs["last_hidden_state"],
-            base_values=values,
-        )
-        return {
-            "embeddings": e_cont,
-            "aligned_embeddings": e_aligned,
-            "hidden_states": backbone_outputs["last_hidden_state"],
-            "past_key_values": backbone_outputs["past_key_values"],
-            "point_forecast": point_forecast,
-            "params": params,
-            "con_loss": alignment_aux["con_loss"],
-            "trend_loss": alignment_aux["trend_loss"],
-            "token_dist_loss": alignment_aux["token_dist_loss"],
-        }
+        if target.size(1) >= 2:
+            pred_diff = forecast[:, 1:, :] - forecast[:, :-1, :]
+            true_diff = target[:, 1:, :] - target[:, :-1, :]
+            delta_loss = F.smooth_l1_loss(pred_diff, true_diff)
+        else:
+            delta_loss = forecast.new_tensor(0.0)
+
+        if target.size(1) >= 3:
+            pred_diff2 = pred_diff[:, 1:, :] - pred_diff[:, :-1, :]
+            true_diff2 = true_diff[:, 1:, :] - true_diff[:, :-1, :]
+            curve_loss = F.smooth_l1_loss(pred_diff2, true_diff2)
+        else:
+            curve_loss = forecast.new_tensor(0.0)
+
+        return mse_loss, point_loss, delta_loss, curve_loss
+
+    def _decode_latent_patches(self, hidden_states):
+        predicted_aligned = self.latent_head(hidden_states)
+        predicted_latent, _ = self.decompensate_embeddings(predicted_aligned)
+        patch_values = self.patch_decoder(predicted_latent)
+        return predicted_aligned, predicted_latent, patch_values
+
+    def _prepare_patch_sequence(self, history_values, future_values=None):
+        history_latent, history_aux = self.embedding.encode(history_values, position_offset=0)
+        future_latent = None
+        future_aux = None
+        if future_values is not None:
+            future_latent, future_aux = self.embedding.encode(
+                future_values,
+                position_offset=history_latent.size(1),
+            )
+        return history_latent, history_aux, future_latent, future_aux
+
+    def _forecast_from_patch_values(self, patch_values, target_length):
+        return self.embedding.overlap_add(patch_values, target_length=target_length)
 
     def generate_sampling_paths(self, prefix_values, horizon, num_paths):
-        if prefix_values.dim() == 2:
-            prefix_values = prefix_values.unsqueeze(-1)
-        if num_paths <= 0:
-            raise ValueError("num_paths must be positive.")
-
-        batch_size = prefix_values.size(0)
-        repeated_prefix = prefix_values.repeat_interleave(num_paths, dim=0)
-        generated = repeated_prefix
-        sampled_steps = []
-        mean_steps = []
-        past_key_values = None
-
-        for _ in range(horizon):
-            decoder_input = generated if past_key_values is None else generated[:, -1:, :]
-            step_outputs = self.forward_components(
-                decoder_input,
-                past_key_values=past_key_values,
-                use_cache=True,
-                compute_alignment_losses=False,
-            )
-            past_key_values = step_outputs["past_key_values"]
-            sampled_next = self.output_decoder.sample(
-                {
-                    "mu": step_outputs["params"]["mu"][:, -1:, ...],
-                    "log_sigma2": step_outputs["params"]["log_sigma2"][:, -1:, ...],
-                    "mixture_logits": None if step_outputs["params"]["mixture_logits"] is None else step_outputs["params"]["mixture_logits"][:, -1:, ...],
-                    "mixture_probs": None if step_outputs["params"]["mixture_probs"] is None else step_outputs["params"]["mixture_probs"][:, -1:, ...],
-                },
-                num_samples=1,
-            )[:, 0, :, :]
-            mean_next = step_outputs["point_forecast"][:, -1:, :]
-            sampled_steps.append(sampled_next)
-            mean_steps.append(mean_next)
-            generated = torch.cat([generated, sampled_next], dim=1)
-
-        sampled_paths = torch.cat(sampled_steps, dim=1).view(batch_size, num_paths, horizon, -1)
-        mean_paths = torch.cat(mean_steps, dim=1).view(batch_size, num_paths, horizon, -1)
-        return sampled_paths, mean_paths
+        point_forecast, aux = self.forward(
+            history_values=prefix_values,
+            future_values=None,
+            pred_steps=horizon,
+            teacher_forcing=False,
+        )
+        paths = point_forecast.unsqueeze(1).repeat(1, num_paths, 1, 1)
+        return paths, paths
 
     def forward(self, history_values, future_values=None, pred_steps=None, teacher_forcing=True):
         if history_values.dim() == 2:
@@ -242,35 +216,50 @@ class ContinuousGPT2Forecaster(nn.Module):
         if future_values is not None and future_values.dim() == 2:
             future_values = future_values.unsqueeze(-1)
 
+        history_latent, history_aux, future_latent, future_aux = self._prepare_patch_sequence(
+            history_values,
+            future_values=future_values,
+        )
+        history_patch_count = history_latent.size(1)
+
         if teacher_forcing and future_values is not None:
-            history_len = history_values.size(1)
-            input_values = torch.cat([history_values, future_values[:, :-1, :]], dim=1)
-            outputs = self.forward_components(
-                input_values,
-                use_cache=False,
-                compute_alignment_losses=self.use_alignment,
+            input_latent = torch.cat([history_latent, future_latent[:, :-1, :]], dim=1)
+            aligned_input, alignment_aux = self.align_embeddings(
+                input_latent,
+                compute_losses=self.use_alignment,
             )
-            prev_values = input_values[:, history_len - 1 :, :]
-            params = {
-                key: None if value is None else value[:, history_len - 1 :, ...]
-                for key, value in outputs["params"].items()
-            }
-            forecast = outputs["point_forecast"][:, history_len - 1 :, :]
+            backbone_outputs = self.backbone_forward(aligned_input)
+            future_hidden = backbone_outputs["last_hidden_state"][:, history_patch_count - 1 :, :]
+            predicted_aligned, predicted_latent, future_patch_values = self._decode_latent_patches(future_hidden)
+            forecast = self._forecast_from_patch_values(
+                future_patch_values,
+                target_length=future_values.size(1),
+            )
+
+            distribution_loss, point_loss, delta_loss, curve_loss = self._compute_prediction_losses(
+                forecast,
+                future_values,
+            )
+            latent_recon_loss = F.smooth_l1_loss(predicted_latent, future_latent)
+            point_loss = point_loss + 0.2 * latent_recon_loss
+            comp_reg_loss = alignment_aux.get("comp_reg_loss", forecast.new_tensor(0.0))
+
             return forecast, {
-                "embeddings": outputs["embeddings"],
-                "aligned_embeddings": outputs["aligned_embeddings"],
-                "hidden_states": outputs["hidden_states"],
-                "mu": params["mu"],
-                "log_sigma2": params["log_sigma2"],
-                "mixture_logits": params["mixture_logits"],
-                "mixture_probs": params["mixture_probs"],
-                "delta": params.get("delta"),
-                "distribution_loss": self.output_decoder.negative_log_likelihood(future_values, params),
-                "point_loss": self.output_decoder.point_loss(future_values, params),
-                "delta_loss": self.output_decoder.trend_regression_loss(future_values, prev_values, params),
-                "con_loss": outputs["con_loss"],
-                "trend_loss": outputs["trend_loss"],
-                "token_dist_loss": outputs["token_dist_loss"],
+                "embeddings": input_latent,
+                "aligned_embeddings": aligned_input,
+                "hidden_states": backbone_outputs["last_hidden_state"],
+                "mu": forecast,
+                "log_sigma2": torch.ones_like(forecast) * self.log_variance.clamp(-6.0, 3.0),
+                "mixture_logits": None,
+                "mixture_probs": None,
+                "delta": None,
+                "distribution_loss": distribution_loss,
+                "point_loss": point_loss,
+                "delta_loss": delta_loss,
+                "con_loss": alignment_aux.get("con_loss", forecast.new_tensor(0.0))
+                + 0.01 * comp_reg_loss,
+                "trend_loss": curve_loss,
+                "token_dist_loss": alignment_aux.get("token_dist_loss", forecast.new_tensor(0.0)),
                 "sample_paths": None,
                 "mean_paths": None,
             }
@@ -278,83 +267,60 @@ class ContinuousGPT2Forecaster(nn.Module):
         if pred_steps is None:
             raise ValueError("pred_steps must be provided for autoregressive prediction.")
 
-        generated = history_values
-        forecast_steps = []
-        mu_steps = []
-        log_sigma2_steps = []
-        mixture_logits_steps = []
-        mixture_probs_steps = []
-        delta_steps = []
-        prev_value_steps = []
-        past_key_values = None
+        target_patch_count = self.embedding.num_patches_for_length(
+            pred_steps,
+            self.patch_size,
+            self.patch_stride,
+        )
+        generated_latent = history_latent
+        predicted_patch_values = []
+        predicted_aligned_states = []
+        predicted_latent_states = []
 
-        for _ in range(pred_steps):
-            decoder_input = generated if past_key_values is None else generated[:, -1:, :]
-            step_outputs = self.forward_components(
-                decoder_input,
-                past_key_values=past_key_values,
-                use_cache=True,
-                compute_alignment_losses=False,
+        for _ in range(target_patch_count):
+            aligned_input, _ = self.align_embeddings(generated_latent, compute_losses=False)
+            backbone_outputs = self.backbone_forward(aligned_input)
+            next_hidden = backbone_outputs["last_hidden_state"][:, -1:, :]
+            next_aligned, next_latent, next_patch = self._decode_latent_patches(next_hidden)
+            next_input_latent = self.embedding.encode_patch_values(
+                next_patch,
+                position_offset=generated_latent.size(1),
             )
-            past_key_values = step_outputs["past_key_values"]
-            next_value = step_outputs["point_forecast"][:, -1:, :]
-            prev_value_steps.append(decoder_input[:, -1:, :])
-            forecast_steps.append(next_value)
-            mu_steps.append(step_outputs["params"]["mu"][:, -1:, ...])
-            log_sigma2_steps.append(step_outputs["params"]["log_sigma2"][:, -1:, ...])
-            if step_outputs["params"].get("delta") is not None:
-                delta_steps.append(step_outputs["params"]["delta"][:, -1:, ...])
-            if step_outputs["params"]["mixture_logits"] is not None:
-                mixture_logits_steps.append(step_outputs["params"]["mixture_logits"][:, -1:, ...])
-                mixture_probs_steps.append(step_outputs["params"]["mixture_probs"][:, -1:, ...])
-            generated = torch.cat([generated, next_value], dim=1)
+            generated_latent = torch.cat([generated_latent, next_input_latent], dim=1)
+            predicted_aligned_states.append(next_aligned)
+            predicted_latent_states.append(next_latent)
+            predicted_patch_values.append(next_patch)
 
-        mu = torch.cat(mu_steps, dim=1)
-        log_sigma2 = torch.cat(log_sigma2_steps, dim=1)
-        mixture_logits = torch.cat(mixture_logits_steps, dim=1) if mixture_logits_steps else None
-        mixture_probs = torch.cat(mixture_probs_steps, dim=1) if mixture_probs_steps else None
-        delta = torch.cat(delta_steps, dim=1) if delta_steps else None
-        prev_values = torch.cat(prev_value_steps, dim=1) if prev_value_steps else None
-        forecast = torch.cat(forecast_steps, dim=1)
+        predicted_patch_values = torch.cat(predicted_patch_values, dim=1)
+        forecast = self._forecast_from_patch_values(predicted_patch_values, target_length=pred_steps)
+
+        mu = forecast
+        log_sigma2 = torch.ones_like(forecast) * self.log_variance.clamp(-6.0, 3.0)
         distribution_loss = None
         point_loss = None
         delta_loss = None
+        trend_loss = None
         if future_values is not None:
-            params = {
-                "mu": mu,
-                "log_sigma2": log_sigma2,
-                "mixture_logits": mixture_logits,
-                "mixture_probs": mixture_probs,
-                "delta": delta,
-            }
-            distribution_loss = self.output_decoder.negative_log_likelihood(future_values, params)
-            point_loss = self.output_decoder.point_loss(future_values, params)
-            delta_loss = self.output_decoder.trend_regression_loss(future_values, prev_values, params)
-
-        sample_paths = None
-        mean_paths = None
-        if self.num_sampling_paths > 0:
-            sample_paths, mean_paths = self.generate_sampling_paths(
-                prefix_values=history_values,
-                horizon=pred_steps,
-                num_paths=self.num_sampling_paths,
+            distribution_loss, point_loss, delta_loss, trend_loss = self._compute_prediction_losses(
+                forecast,
+                future_values,
             )
 
         return forecast, {
-            "embeddings": None,
-            "aligned_embeddings": None,
+            "embeddings": history_latent,
+            "aligned_embeddings": None if not predicted_aligned_states else torch.cat(predicted_aligned_states, dim=1),
             "hidden_states": None,
             "mu": mu,
             "log_sigma2": log_sigma2,
-            "mixture_logits": mixture_logits,
-            "mixture_probs": mixture_probs,
-            "delta": delta,
+            "mixture_logits": None,
+            "mixture_probs": None,
+            "delta": None,
             "distribution_loss": distribution_loss,
             "point_loss": point_loss,
             "delta_loss": delta_loss,
             "con_loss": forecast.new_tensor(0.0),
-            "trend_loss": forecast.new_tensor(0.0),
+            "trend_loss": trend_loss if trend_loss is not None else forecast.new_tensor(0.0),
             "token_dist_loss": forecast.new_tensor(0.0),
-            "sample_paths": sample_paths,
-            "mean_paths": mean_paths,
+            "sample_paths": None,
+            "mean_paths": None,
         }

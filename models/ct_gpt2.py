@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.chronos_scaler import ChronosMeanScaler
 from models.ct_gpt2_forecaster import ContinuousGPT2Forecaster
@@ -18,6 +19,8 @@ class CTGPT2Forecasting(nn.Module):
         super().__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
+        self.patch_size = getattr(configs, "patch_size", 8)
+        self.patch_stride = getattr(configs, "patch_stride", self.patch_size)
         self.use_linear_shortcut = getattr(configs, "use_linear_shortcut", True)
         self.use_chronos_scaling = getattr(configs, "use_chronos_scaling", False)
 
@@ -28,12 +31,22 @@ class CTGPT2Forecasting(nn.Module):
             )
 
         self.sample_scaler = ChronosMeanScaler(eps=getattr(configs, "scaling_eps", 1e-8))
+        history_patches = ContinuousGPT2Forecaster.num_patches_for_length(
+            self.seq_len,
+            self.patch_size,
+            self.patch_stride,
+        )
+        future_patches = ContinuousGPT2Forecaster.num_patches_for_length(
+            self.pred_len,
+            self.patch_size,
+            self.patch_stride,
+        )
         self.forecaster = ContinuousGPT2Forecaster(
             d_model=configs.d_model,
             n_layers=configs.n_layers,
             n_heads=configs.n_heads,
             dropout=getattr(configs, "dropout", 0.1),
-            max_len=max(2, self.seq_len + self.pred_len),
+            max_len=max(2, history_patches + future_patches + 1),
             model_name=getattr(configs, "gpt_model_name", "openai-community/gpt2"),
             local_model_path=getattr(configs, "gpt_local_path", "./gpt"),
             use_pretrained=getattr(configs, "use_pretrained_gpt2", True),
@@ -59,6 +72,8 @@ class CTGPT2Forecasting(nn.Module):
             use_trend_regression=getattr(configs, "use_trend_regression", True),
             freeze_gpt2=getattr(configs, "freeze_gpt2", True),
             gpt2_trainable_layers=getattr(configs, "gpt2_trainable_layers", 1),
+            patch_size=self.patch_size,
+            patch_stride=self.patch_stride,
         )
         if self.use_linear_shortcut:
             self.linear_shortcut = nn.Linear(self.seq_len, self.pred_len)
@@ -112,23 +127,17 @@ class CTGPT2Forecasting(nn.Module):
             aux["sample_paths"] = self.sample_scaler.unscale(aux["sample_paths"], scale.unsqueeze(1))
         if aux.get("mean_paths") is not None:
             aux["mean_paths"] = self.sample_scaler.unscale(aux["mean_paths"], scale.unsqueeze(1))
-        if target is not None and aux.get("mu") is not None and aux.get("log_sigma2") is not None:
-            aux["distribution_loss"] = self.forecaster.output_decoder.negative_log_likelihood(
-                target,
-                {
-                    "mu": aux["mu"],
-                    "log_sigma2": aux["log_sigma2"],
-                    "mixture_logits": aux.get("mixture_logits"),
-                    "mixture_probs": aux.get("mixture_probs"),
-                },
-            )
-            aux["point_loss"] = self.forecaster.output_decoder.point_loss(
-                target,
-                {
-                    "mu": aux["mu"],
-                    "mixture_probs": aux.get("mixture_probs"),
-                },
-            )
+        if target is not None and aux.get("mu") is not None:
+            aux["distribution_loss"] = F.mse_loss(aux["mu"], target)
+            aux["point_loss"] = F.smooth_l1_loss(aux["mu"], target)
+            if target.size(1) >= 2:
+                pred_diff = aux["mu"][:, 1:, :] - aux["mu"][:, :-1, :]
+                true_diff = target[:, 1:, :] - target[:, :-1, :]
+                aux["delta_loss"] = F.smooth_l1_loss(pred_diff, true_diff)
+            if target.size(1) >= 3:
+                pred_curve = pred_diff[:, 1:, :] - pred_diff[:, :-1, :]
+                true_curve = true_diff[:, 1:, :] - true_diff[:, :-1, :]
+                aux["trend_loss"] = F.smooth_l1_loss(pred_curve, true_curve)
         return forecast, aux
 
     def forward(self, x, y=None, teacher_forcing=True):
@@ -150,38 +159,24 @@ class CTGPT2Forecasting(nn.Module):
         if shortcut is not None:
             forecast = forecast + shortcut
             if aux.get("mu") is not None:
-                if aux.get("mixture_logits") is None:
-                    aux["mu"] = aux["mu"] + shortcut
-                else:
-                    aux["mu"] = aux["mu"] + shortcut.unsqueeze(-2)
+                aux["mu"] = aux["mu"] + shortcut
             if model_y is not None and aux.get("mu") is not None:
-                aux["point_loss"] = self.forecaster.output_decoder.point_loss(
-                    model_y,
-                    {
-                        "mu": aux["mu"],
-                        "mixture_probs": aux.get("mixture_probs"),
-                    },
-                )
+                aux["distribution_loss"] = F.mse_loss(aux["mu"], model_y)
+                aux["point_loss"] = F.smooth_l1_loss(aux["mu"], model_y)
 
         if self.use_chronos_scaling:
             forecast, aux = self._apply_inverse_scaling(forecast, aux, scale, target=y)
-        elif y is not None and aux.get("mu") is not None and aux.get("log_sigma2") is not None:
-            aux["distribution_loss"] = self.forecaster.output_decoder.negative_log_likelihood(
-                y,
-                {
-                    "mu": aux["mu"],
-                    "log_sigma2": aux["log_sigma2"],
-                    "mixture_logits": aux.get("mixture_logits"),
-                    "mixture_probs": aux.get("mixture_probs"),
-                },
-            )
-            aux["point_loss"] = self.forecaster.output_decoder.point_loss(
-                y,
-                {
-                    "mu": aux["mu"],
-                    "mixture_probs": aux.get("mixture_probs"),
-                },
-            )
+        elif y is not None and aux.get("mu") is not None:
+            aux["distribution_loss"] = F.mse_loss(aux["mu"], y)
+            aux["point_loss"] = F.smooth_l1_loss(aux["mu"], y)
+            if y.size(1) >= 2:
+                pred_diff = aux["mu"][:, 1:, :] - aux["mu"][:, :-1, :]
+                true_diff = y[:, 1:, :] - y[:, :-1, :]
+                aux["delta_loss"] = F.smooth_l1_loss(pred_diff, true_diff)
+            if y.size(1) >= 3:
+                pred_curve = pred_diff[:, 1:, :] - pred_diff[:, :-1, :]
+                true_curve = true_diff[:, 1:, :] - true_diff[:, :-1, :]
+                aux["trend_loss"] = F.smooth_l1_loss(pred_curve, true_curve)
 
         aux["scale"] = scale
         return forecast, None, None, None, aux
